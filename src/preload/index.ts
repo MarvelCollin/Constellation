@@ -11,7 +11,6 @@ import type {
   MainServerResponse,
   PortCleanupResponse,
   StartMainServerOptions,
-  ZrokEnableRequest,
   ZrokEnableResponse,
 } from "../shared/hardware";
 
@@ -22,7 +21,7 @@ contextBridge.exposeInMainWorld("constellation", {
   allowFirewall: (): Promise<FirewallPermissionResponse> => ipcRenderer.invoke("main-server:allow-firewall"),
   clearServerPort: (): Promise<PortCleanupResponse> => ipcRenderer.invoke("main-server:clear-port"),
   diagnoseHost: (): Promise<HostDiagnosticsResponse> => ipcRenderer.invoke("main-server:diagnose"),
-  enableZrok: (request: ZrokEnableRequest): Promise<ZrokEnableResponse> => ipcRenderer.invoke("main-server:enable-zrok", request),
+  enableZrok: (): Promise<ZrokEnableResponse> => ipcRenderer.invoke("main-server:enable-zrok"),
   fetchChat: (request: ChatFetchRequest): Promise<ChatResponse> => ipcRenderer.invoke("chat:fetch", request),
   getMainServerState: (): Promise<MainServerResponse> => ipcRenderer.invoke("main-server:state"),
   scanHardware: (): Promise<HardwareScanResponse> => ipcRenderer.invoke("hardware:scan"),

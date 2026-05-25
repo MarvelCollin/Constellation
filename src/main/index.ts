@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, Menu } from "electron";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import type { IpcMainInvokeEvent } from "electron";
 import { connect as connectSocket } from "node:net";
 import { hostname, networkInterfaces, tmpdir } from "node:os";
@@ -50,6 +50,32 @@ const runtimePath = join(tmpdir(), "constellation-runtime", String(process.pid))
 mkdirSync(join(runtimePath, "session"), { recursive: true });
 app.commandLine.appendSwitch("disk-cache-dir", join(runtimePath, "cache"));
 app.setPath("sessionData", join(runtimePath, "session"));
+
+function loadEnvFile() {
+  const envPath = join(process.cwd(), ".env");
+
+  if (!existsSync(envPath)) {
+    return;
+  }
+
+  for (const line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    const separator = trimmed.indexOf("=");
+
+    if (!trimmed || trimmed.startsWith("#") || separator < 1) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separator).trim();
+    const value = trimmed.slice(separator + 1).trim().replace(/^(['"])(.*)\1$/, "$2");
+
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadEnvFile();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -680,12 +706,12 @@ async function diagnoseHost(): Promise<HostDiagnosticsResponse> {
   return { ok: true, data: { summary, checks } };
 }
 
-function enableZrok(_event: IpcMainInvokeEvent, value: unknown): Promise<ZrokEnableResponse> {
-  if (!isRecord(value) || typeof value.token !== "string" || value.token.trim().length < 8) {
-    return Promise.resolve({ ok: false, error: "Enter a valid zrok account token." });
-  }
+function enableZrok(_event: IpcMainInvokeEvent): Promise<ZrokEnableResponse> {
+  const token = process.env.ZROK_TOKEN?.trim();
 
-  const token = value.token.trim();
+  if (!token || token.length < 8) {
+    return Promise.resolve({ ok: false, error: "Set ZROK_TOKEN in .env before enabling zrok." });
+  }
 
   return new Promise((resolve) => {
     const child = spawn(zrokCommand(), ["enable", "--headless", token], {
@@ -707,7 +733,14 @@ function enableZrok(_event: IpcMainInvokeEvent, value: unknown): Promise<ZrokEna
 
     child.on("close", (code) => {
       if (code !== 0) {
-        resolve({ ok: false, error: output.trim() || `zrok enable exited with code ${code}` });
+        const message = output.trim() || `zrok enable exited with code ${code}`;
+
+        if (message.includes("already have an enabled environment")) {
+          resolve({ ok: true, message: "zrok is already enabled on this machine." });
+          return;
+        }
+
+        resolve({ ok: false, error: message });
         return;
       }
 
@@ -749,19 +782,20 @@ function startZrokTunnel(): Promise<MainServerResponse> {
 
     const readOutput = (chunk: Buffer) => {
       output += chunk.toString();
-      const match = output.match(/https:\/\/[^\s"']+/i);
+      const match = output.match(/(?:https:\/\/)?[a-z0-9-]+\.shares\.zrok\.io/i);
 
       if (!match) {
         return;
       }
 
+      const tunnelUrl = match[0].startsWith("http") ? match[0] : `https://${match[0]}`;
       zrokTunnelProcess = child;
       mainServerState = {
         ...mainServerState,
         tunnelRunning: true,
-        tunnelUrl: match[0],
+        tunnelUrl,
         tunnelPid: child.pid ?? null,
-        tunnelNote: "zrok public share is active. Share this URL plus the join secret.",
+        tunnelNote: "zrok forwards traffic to this laptop. Share this URL plus the join secret.",
       };
       finish({ ok: true, data: currentMainServerState() });
     };

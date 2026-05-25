@@ -75,10 +75,6 @@ export type PortCleanupResponse =
       error: string;
     };
 
-export type ZrokEnableRequest = {
-  token: string;
-};
-
 export type ZrokEnableResponse =
   | {
       ok: true;

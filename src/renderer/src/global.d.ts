@@ -12,7 +12,6 @@ import type {
   MainServerResponse,
   PortCleanupResponse,
   StartMainServerOptions,
-  ZrokEnableRequest,
   ZrokEnableResponse,
 } from "../../shared/hardware";
 
@@ -24,7 +23,7 @@ declare global {
       allowFirewall: () => Promise<FirewallPermissionResponse>;
       clearServerPort: () => Promise<PortCleanupResponse>;
       diagnoseHost: () => Promise<HostDiagnosticsResponse>;
-      enableZrok: (request: ZrokEnableRequest) => Promise<ZrokEnableResponse>;
+      enableZrok: () => Promise<ZrokEnableResponse>;
       fetchChat: (request: ChatFetchRequest) => Promise<ChatResponse>;
       getMainServerState: () => Promise<MainServerResponse>;
       scanHardware: () => Promise<HardwareScanResponse>;

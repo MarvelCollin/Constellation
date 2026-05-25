@@ -35,7 +35,7 @@ export function ResourceOverview() {
   const [portCleanupMessage, setPortCleanupMessage] = useState("Force clear only stale Constellation server on port 8765.");
   const [tunnelBusy, setTunnelBusy] = useState(false);
   const [zrokBusy, setZrokBusy] = useState(false);
-  const [zrokMessage, setZrokMessage] = useState("Enable zrok once with a free account token.");
+  const [zrokMessage, setZrokMessage] = useState("Enable zrok from ZROK_TOKEN in .env.");
   const [connectedServer, setConnectedServer] = useState<ConnectedServerState | null>(null);
   const [connectError, setConnectError] = useState<string | null>(null);
   const [connectBusy, setConnectBusy] = useState(false);
@@ -267,7 +267,7 @@ export function ResourceOverview() {
     }
   }
 
-  async function handleEnableZrok(token: string) {
+  async function handleEnableZrok() {
     if (!window.constellation?.enableZrok) {
       setServerError("Desktop bridge is unavailable. Open the Electron app window, not the Vite localhost page.");
       return;
@@ -278,7 +278,7 @@ export function ResourceOverview() {
     setZrokMessage("Enabling zrok on this machine.");
 
     try {
-      const response = await window.constellation.enableZrok({ token });
+      const response = await window.constellation.enableZrok();
 
       if (!response.ok) {
         setZrokMessage(response.error);
@@ -312,6 +312,54 @@ export function ResourceOverview() {
       setServerState(response.data);
       await handleDiagnoseHost();
     } finally {
+      setTunnelBusy(false);
+    }
+  }
+
+  async function handleStartSharing() {
+    if (!window.constellation?.enableZrok || !window.constellation?.startMainServer || !window.constellation?.startZrokTunnel) {
+      setServerError("Desktop bridge is unavailable. Open the Electron app window, not the Vite localhost page.");
+      return;
+    }
+
+    setServerBusy(true);
+    setZrokBusy(true);
+    setTunnelBusy(true);
+    setServerError(null);
+    setZrokMessage("Preparing zrok tunnel.");
+
+    try {
+      const zrokResponse = await window.constellation.enableZrok();
+
+      if (!zrokResponse.ok) {
+        setZrokMessage(zrokResponse.error);
+        setServerError(zrokResponse.error);
+        return;
+      }
+
+      setZrokMessage(zrokResponse.message);
+
+      const serverResponse = await window.constellation.startMainServer({ exposure: "internet" });
+
+      if (!serverResponse.ok) {
+        setServerError(serverResponse.error);
+        return;
+      }
+
+      setServerState(serverResponse.data);
+
+      const tunnelResponse = await window.constellation.startZrokTunnel();
+
+      if (!tunnelResponse.ok) {
+        setServerError(tunnelResponse.error);
+        return;
+      }
+
+      setServerState(tunnelResponse.data);
+      await handleDiagnoseHost();
+    } finally {
+      setServerBusy(false);
+      setZrokBusy(false);
       setTunnelBusy(false);
     }
   }
@@ -445,22 +493,16 @@ export function ResourceOverview() {
             diagnosticBusy={diagnosticBusy}
             diagnostics={diagnostics}
             error={serverError}
-            firewallAllowed={firewallAllowed}
-            firewallBusy={firewallBusy}
             firewallMessage={firewallMessage}
             portCleanupBusy={portCleanupBusy}
             portCleanupMessage={portCleanupMessage}
             tunnelBusy={tunnelBusy}
             zrokBusy={zrokBusy}
             zrokMessage={zrokMessage}
-            onAllowFirewall={handleAllowFirewall}
             onClearPort={handleClearPort}
             onDiagnose={handleDiagnoseHost}
-            onEnableZrok={handleEnableZrok}
-            onStart={handleStartServer}
-            onStartTunnel={handleStartTunnel}
+            onStartSharing={handleStartSharing}
             onStop={handleStopServer}
-            onStopTunnel={handleStopTunnel}
             state={serverState}
           />
           <ChatPanel
