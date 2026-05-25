@@ -13,6 +13,7 @@ export function ConnectServerPanel({ busy, connection, error, onConnect }: Conne
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
   const canConnect = url.trim().length > 0 && token.trim().length >= 8;
+  const statusText = connection ? "Connected to server" : "Not connected";
   const gpuText = connection?.hardware.gpus.length
     ? connection.hardware.gpus.map((gpu) => `${gpu.name} (${formatGpuMemory(gpu.memory_mb)})`).join(", ")
     : connection
@@ -23,11 +24,9 @@ export function ConnectServerPanel({ busy, connection, error, onConnect }: Conne
     <section className="server-panel" aria-labelledby="connect-heading">
       <div className="server-header">
         <div>
-          <span className={connection ? "scan-state scan-state-ready" : "scan-state"}>
-            {connection ? "Connected" : "Not connected"}
-          </span>
+          <span className={connection ? "scan-state scan-state-ready" : "scan-state"}>{statusText}</span>
           <h2 id="connect-heading">Connect to main server</h2>
-          <p>Join another coordinator by entering its URL and generated token.</p>
+          <p>{connection ? "This laptop is joined and can use the remote coordinator." : "Join another coordinator with the shared URL and join secret."}</p>
         </div>
         <div className="server-actions">
           <button
@@ -36,7 +35,7 @@ export function ConnectServerPanel({ busy, connection, error, onConnect }: Conne
             onClick={() => onConnect({ url, token })}
             type="button"
           >
-            {busy ? "Connecting..." : "Connect"}
+            {busy ? "Connecting..." : connection ? "Reconnect" : "Connect"}
           </button>
         </div>
       </div>
@@ -55,12 +54,12 @@ export function ConnectServerPanel({ busy, connection, error, onConnect }: Conne
           />
         </label>
         <label className="field">
-          <span>Token</span>
+          <span>Join secret</span>
           <input
             disabled={busy}
             minLength={8}
             onChange={(event) => setToken(event.currentTarget.value)}
-            placeholder="Generated token"
+            placeholder="Join secret"
             type="password"
             value={token}
           />

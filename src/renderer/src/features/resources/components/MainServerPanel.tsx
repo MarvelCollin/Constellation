@@ -22,6 +22,7 @@ export function MainServerPanel({ busy, diagnosticBusy, diagnostics, error, fire
   const running = state?.running ?? false;
   const tunnelRunning = state?.tunnelRunning ?? false;
   const setupBusy = busy || tunnelBusy || zrokBusy;
+  const statusText = tunnelRunning ? "Sharing online" : running ? "Server online" : "Server offline";
   const token = state?.token ?? "Generated when server starts";
   const shareUrl = state?.tunnelUrl ?? "Start sharing to get public URL";
 
@@ -29,7 +30,7 @@ export function MainServerPanel({ busy, diagnosticBusy, diagnostics, error, fire
     <section className="server-panel" aria-labelledby="server-heading">
       <div className="server-header">
         <div>
-          <span className={running ? "scan-state scan-state-ready" : "scan-state"}>{running ? "Server online" : "Server offline"}</span>
+          <span className={running ? "scan-state scan-state-ready" : "scan-state"}>{statusText}</span>
           <h2 id="server-heading">Main node server</h2>
           <p>Start this laptop as the coordinator; zrok only exposes it with a public URL.</p>
         </div>
@@ -100,7 +101,7 @@ export function MainServerPanel({ busy, diagnosticBusy, diagnostics, error, fire
         </div>
         <div>
           <span>What friends need</span>
-          <strong>Only the share URL and join secret.</strong>
+          <strong>{tunnelRunning ? "Send only the share URL and join secret." : "Start sharing first."}</strong>
         </div>
       </div>
     </section>
