@@ -2,9 +2,13 @@ node_modules
 out
 dist
 release
+.venv
+__pycache__
+*.pyc
 .env
 .env.local
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+DESIGN.md

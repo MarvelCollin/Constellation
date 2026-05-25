@@ -11,15 +11,12 @@ export function AppShell({ children }: AppShellProps) {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <header className="top-nav">
         <div className="brand">
-          <div className="brand-mark">C</div>
-          <div>
-            <strong>Constellation</strong>
-            <span>AI compute desktop</span>
-          </div>
+          <span className="brand-mark">C</span>
+          <strong>Constellation</strong>
         </div>
-        <nav className="navigation" aria-label="Main">
+        <nav className="navigation" aria-label="Main navigation">
           {navigationItems.map((item) => (
             <button
               className={item === "Overview" ? "nav-item active" : "nav-item"}
@@ -30,20 +27,14 @@ export function AppShell({ children }: AppShellProps) {
             </button>
           ))}
         </nav>
-        <div className="node-status">
-          <span>Platform</span>
-          <strong>{platform}</strong>
+        <div className="nav-actions">
+          <span>{platform}</span>
+          <button className="button-primary" type="button">
+            Prepare node
+          </button>
         </div>
-      </aside>
-      <div className="workspace">
-        <header className="topbar">
-          <div>
-            <h1>Shared compute control</h1>
-            <p>Prepare this machine to contribute memory, GPU, storage, and network capacity.</p>
-          </div>
-        </header>
-        <main className="content">{children}</main>
-      </div>
+      </header>
+      <main className="content">{children}</main>
     </div>
   );
 }

@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "tsc -b && electron-vite build",
+    "postinstall": "node node_modules/electron/install.js",
     "preview": "electron-vite preview",
-    "dist": "npm run build && electron-builder"
+    "dist": "npm run build && electron-builder",
+    "worker:probe": "cd python && python -m constellation_worker"
   },
   "build": {
     "appId": "app.constellation.desktop",
