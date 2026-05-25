@@ -5,19 +5,24 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 from typing import TypedDict
 
 
 class GpuInfo(TypedDict):
   name: str
-  memory_mb: str
+  memory_mb: int
   driver: str
 
 
 class HardwareSnapshot(TypedDict):
   platform: str
+  python_version: str
   cpu_count: int | None
   memory_bytes: int | None
+  storage_bytes: int | None
+  storage_free_bytes: int | None
   gpus: list[GpuInfo]
 
 
@@ -53,6 +58,16 @@ def total_memory_bytes() -> int | None:
   return None
 
 
+def storage_usage() -> tuple[int, int] | tuple[None, None]:
+  root = Path.home().anchor or Path.cwd().anchor
+
+  if not root:
+    return None, None
+
+  usage = shutil.disk_usage(root)
+  return int(usage.total), int(usage.free)
+
+
 def nvidia_gpus() -> list[GpuInfo]:
   binary = shutil.which("nvidia-smi")
 
@@ -77,15 +92,20 @@ def nvidia_gpus() -> list[GpuInfo]:
 
   for line in result.stdout.splitlines():
     name, memory_mb, driver = [value.strip() for value in line.split(",", maxsplit=2)]
-    gpus.append({"name": name, "memory_mb": memory_mb, "driver": driver})
+    gpus.append({"name": name, "memory_mb": int(memory_mb), "driver": driver})
 
   return gpus
 
 
 def snapshot() -> HardwareSnapshot:
+  storage_bytes, storage_free_bytes = storage_usage()
+
   return {
     "platform": platform.platform(),
+    "python_version": sys.version.split()[0],
     "cpu_count": os.cpu_count(),
     "memory_bytes": total_memory_bytes(),
+    "storage_bytes": storage_bytes,
+    "storage_free_bytes": storage_free_bytes,
     "gpus": nvidia_gpus(),
   }

@@ -4,9 +4,19 @@ import { defineConfig, externalizeDepsPlugin } from "electron-vite";
 
 export default defineConfig({
   main: {
+    build: {
+      rollupOptions: {
+        input: resolve("src/main/index.ts"),
+      },
+    },
     plugins: [externalizeDepsPlugin()],
   },
   preload: {
+    build: {
+      rollupOptions: {
+        input: resolve("src/preload/index.ts"),
+      },
+    },
     plugins: [externalizeDepsPlugin()],
   },
   renderer: {

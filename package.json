@@ -18,6 +18,12 @@
       "out/**",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "python",
+        "to": "python"
+      }
+    ],
     "directories": {
       "output": "release"
     }

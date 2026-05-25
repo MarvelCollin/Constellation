@@ -23,6 +23,7 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.web.tsbuildinfo"
   },
   "include": [
+    "src/shared/**/*.ts",
     "src/renderer/src"
   ]
 }
