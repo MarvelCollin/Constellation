@@ -9,7 +9,8 @@
     "postinstall": "node node_modules/electron/install.js",
     "preview": "electron-vite preview",
     "dist": "npm run build && electron-builder",
-    "worker:probe": "cd python && python -m constellation_worker"
+    "worker:probe": "cd python && python -m constellation_worker",
+    "worker:server": "cd python && python -m constellation_worker.server --host 127.0.0.1 --port 8765 --token dev-token"
   },
   "build": {
     "appId": "app.constellation.desktop",
@@ -22,10 +23,17 @@
       {
         "from": "python",
         "to": "python"
+      },
+      {
+        "from": "bin/zrok2.exe",
+        "to": "zrok/zrok2.exe"
       }
     ],
     "directories": {
       "output": "release"
+    },
+    "win": {
+      "signAndEditExecutable": false
     }
   },
   "dependencies": {
