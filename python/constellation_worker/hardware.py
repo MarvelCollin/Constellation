@@ -13,7 +13,9 @@ from typing import TypedDict
 class GpuInfo(TypedDict):
   name: str
   memory_mb: int
+  memory_free_mb: int
   driver: str
+  vendor: str
 
 
 class HardwareSnapshot(TypedDict):
@@ -21,8 +23,10 @@ class HardwareSnapshot(TypedDict):
   python_version: str
   cpu_count: int | None
   memory_bytes: int | None
+  memory_free_bytes: int | None
   storage_bytes: int | None
   storage_free_bytes: int | None
+  gpu_vendor: str
   gpus: list[GpuInfo]
 
 
@@ -40,7 +44,7 @@ class MemoryStatus(ctypes.Structure):
   ]
 
 
-def total_memory_bytes() -> int | None:
+def memory_status() -> tuple[int | None, int | None]:
   system = platform.system()
 
   if system == "Windows":
@@ -48,14 +52,15 @@ def total_memory_bytes() -> int | None:
     status.dwLength = ctypes.sizeof(MemoryStatus)
     if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) == 0:
       raise RuntimeError("GlobalMemoryStatusEx failed")
-    return int(status.ullTotalPhys)
+    return int(status.ullTotalPhys), int(status.ullAvailPhys)
 
   if hasattr(os, "sysconf"):
     page_size = os.sysconf("SC_PAGE_SIZE")
-    page_count = os.sysconf("SC_PHYS_PAGES")
-    return int(page_size * page_count)
+    total_pages = os.sysconf("SC_PHYS_PAGES")
+    avail_pages = os.sysconf("SC_AVPHYS_PAGES") if "SC_AVPHYS_PAGES" in os.sysconf_names else total_pages
+    return int(page_size * total_pages), int(page_size * avail_pages)
 
-  return None
+  return None, None
 
 
 def storage_usage() -> tuple[int, int] | tuple[None, None]:
@@ -77,7 +82,7 @@ def nvidia_gpus() -> list[GpuInfo]:
   result = subprocess.run(
     [
       binary,
-      "--query-gpu=name,memory.total,driver_version",
+      "--query-gpu=name,memory.total,memory.free,driver_version",
       "--format=csv,noheader,nounits",
     ],
     capture_output=True,
@@ -91,21 +96,100 @@ def nvidia_gpus() -> list[GpuInfo]:
   gpus: list[GpuInfo] = []
 
   for line in result.stdout.splitlines():
-    name, memory_mb, driver = [value.strip() for value in line.split(",", maxsplit=2)]
-    gpus.append({"name": name, "memory_mb": int(memory_mb), "driver": driver})
+    parts = [value.strip() for value in line.split(",", maxsplit=3)]
+    name, memory_total, memory_free, driver = parts
+    gpus.append({
+      "name": name,
+      "memory_mb": int(memory_total),
+      "memory_free_mb": int(memory_free),
+      "driver": driver,
+      "vendor": "nvidia",
+    })
 
   return gpus
 
 
+def windows_video_controllers() -> list[str]:
+  if platform.system() != "Windows":
+    return []
+
+  result = subprocess.run(
+    [
+      "powershell.exe",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+    ],
+    capture_output=True,
+    text=True,
+    check=False,
+    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+  )
+
+  if result.returncode != 0:
+    return []
+
+  return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def classify_vendor(name: str) -> str:
+  lowered = name.lower()
+
+  if "nvidia" in lowered or "geforce" in lowered or "quadro" in lowered or "tesla" in lowered:
+    return "nvidia"
+
+  if "amd" in lowered or "radeon" in lowered:
+    return "amd"
+
+  if "intel" in lowered or "arc" in lowered:
+    return "intel"
+
+  if "apple" in lowered:
+    return "apple"
+
+  return "unknown"
+
+
+def detect_gpus() -> tuple[list[GpuInfo], str]:
+  gpus = nvidia_gpus()
+  controllers = windows_video_controllers()
+  detected_names = {gpu["name"].lower() for gpu in gpus}
+
+  for name in controllers:
+    if name.lower() in detected_names:
+      continue
+    gpus.append({
+      "name": name,
+      "memory_mb": 0,
+      "memory_free_mb": 0,
+      "driver": "",
+      "vendor": classify_vendor(name),
+    })
+
+  vendor_priority = ["nvidia", "amd", "intel", "apple"]
+
+  for vendor in vendor_priority:
+    if any(gpu["vendor"] == vendor for gpu in gpus):
+      return gpus, vendor
+
+  return gpus, "none"
+
+
 def snapshot() -> HardwareSnapshot:
   storage_bytes, storage_free_bytes = storage_usage()
+  memory_bytes, memory_free_bytes = memory_status()
+  gpus, gpu_vendor = detect_gpus()
 
   return {
     "platform": platform.platform(),
     "python_version": sys.version.split()[0],
     "cpu_count": os.cpu_count(),
-    "memory_bytes": total_memory_bytes(),
+    "memory_bytes": memory_bytes,
+    "memory_free_bytes": memory_free_bytes,
     "storage_bytes": storage_bytes,
     "storage_free_bytes": storage_free_bytes,
-    "gpus": nvidia_gpus(),
+    "gpu_vendor": gpu_vendor,
+    "gpus": gpus,
   }

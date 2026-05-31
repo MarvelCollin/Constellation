@@ -1,7 +1,11 @@
+export type GpuVendor = "nvidia" | "amd" | "intel" | "apple" | "unknown" | "none";
+
 export type GpuInfo = {
   name: string;
   memory_mb: number;
+  memory_free_mb: number;
   driver: string;
+  vendor: GpuVendor;
 };
 
 export type HardwareSnapshot = {
@@ -9,8 +13,10 @@ export type HardwareSnapshot = {
   python_version: string;
   cpu_count: number | null;
   memory_bytes: number | null;
+  memory_free_bytes: number | null;
   storage_bytes: number | null;
   storage_free_bytes: number | null;
+  gpu_vendor: GpuVendor;
   gpus: GpuInfo[];
 };
 
@@ -130,6 +136,7 @@ export type ChatPeer = {
   id: string;
   name: string;
   lastSeen: string;
+  online: boolean;
 };
 
 export type ChatMessage = {

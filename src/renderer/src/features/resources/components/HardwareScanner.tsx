@@ -1,5 +1,5 @@
 import type { HardwareSnapshot } from "../../../../../shared/hardware";
-import { formatBytes, formatGpuMemory } from "../formatHardware";
+import { formatBytes, formatGpuMemory, formatVendor } from "../formatHardware";
 
 type HardwareScannerProps = {
   error: string | null;
@@ -24,14 +24,29 @@ function statusText(status: HardwareScannerProps["status"]) {
   return "Ready to scan";
 }
 
-export function HardwareScanner({ error, onScan, snapshot, status }: HardwareScannerProps) {
-  const gpuSummary =
-    snapshot && snapshot.gpus.length > 0
-      ? `${snapshot.gpus.length} GPU detected`
-      : snapshot
-        ? "No NVIDIA GPU detected"
-        : "Waiting";
+function formatRam(snapshot: HardwareSnapshot | null) {
+  if (!snapshot) {
+    return "Waiting";
+  }
 
+  const total = formatBytes(snapshot.memory_bytes);
+  const free = formatBytes(snapshot.memory_free_bytes);
+  return `${free} free of ${total}`;
+}
+
+function formatGpuSummary(snapshot: HardwareSnapshot | null) {
+  if (!snapshot) {
+    return "Waiting";
+  }
+
+  if (snapshot.gpus.length === 0) {
+    return formatVendor(snapshot.gpu_vendor);
+  }
+
+  return `${snapshot.gpus.length} GPU detected (${formatVendor(snapshot.gpu_vendor)})`;
+}
+
+export function HardwareScanner({ error, onScan, snapshot, status }: HardwareScannerProps) {
   return (
     <section className="scanner-panel" aria-labelledby="scanner-heading">
       <div className="scanner-header">
@@ -54,11 +69,11 @@ export function HardwareScanner({ error, onScan, snapshot, status }: HardwareSca
         </div>
         <div>
           <span>RAM</span>
-          <strong>{formatBytes(snapshot?.memory_bytes)}</strong>
+          <strong>{formatRam(snapshot)}</strong>
         </div>
         <div>
           <span>GPU</span>
-          <strong>{gpuSummary}</strong>
+          <strong>{formatGpuSummary(snapshot)}</strong>
         </div>
         <div>
           <span>Storage</span>
@@ -85,15 +100,18 @@ export function HardwareScanner({ error, onScan, snapshot, status }: HardwareSca
           <span>GPU inventory</span>
           {snapshot?.gpus.length ? (
             snapshot.gpus.map((gpu) => (
-              <article key={`${gpu.name}-${gpu.driver}`}>
+              <article key={`${gpu.name}-${gpu.driver}-${gpu.vendor}`}>
                 <strong>{gpu.name}</strong>
                 <p>
-                  {formatGpuMemory(gpu.memory_mb)} VRAM - Driver {gpu.driver}
+                  {gpu.memory_mb > 0 ? formatGpuMemory(gpu.memory_mb) : "VRAM unknown"}
+                  {gpu.memory_free_mb > 0 ? ` - ${formatGpuMemory(gpu.memory_free_mb)} free` : ""}
+                  {gpu.driver ? ` - Driver ${gpu.driver}` : ""}
+                  {` - ${formatVendor(gpu.vendor)}`}
                 </p>
               </article>
             ))
           ) : (
-            <p>{snapshot ? "No NVIDIA GPU was reported by nvidia-smi." : "Run a scan to detect local GPUs."}</p>
+            <p>{snapshot ? "No GPU detected by the system." : "Run a scan to detect local GPUs."}</p>
           )}
         </div>
       </div>

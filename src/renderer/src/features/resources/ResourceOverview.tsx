@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type {
   ChatSnapshot,
   ChatTarget,
@@ -9,14 +9,38 @@ import type {
   MainServerState,
   StartMainServerOptions,
 } from "../../../../shared/hardware";
+import type {
+  AIState,
+  DownloadProgress,
+  ModelLibrary,
+  RuntimeConfig,
+  SavedModelEntry,
+} from "../../../../shared/ai";
 import { ChatPanel } from "./components/ChatPanel";
 import { ConnectServerPanel } from "./components/ConnectServerPanel";
 import { HardwareScanner } from "./components/HardwareScanner";
 import { MainServerPanel } from "./components/MainServerPanel";
 import { ResourceMatrix } from "./components/ResourceMatrix";
+import { InferencePanel } from "../ai/InferencePanel";
+import { ModelPanel } from "../ai/ModelPanel";
+import { RuntimePanel } from "../ai/RuntimePanel";
+import type { RecommendedModel } from "../ai/recommendedModels";
 
 type ScanStatus = "idle" | "scanning" | "ready" | "error";
 type NodeMode = "host" | "connect";
+
+function downloadIdForModel(model: RecommendedModel) {
+  return `model:${model.id}`;
+}
+
+function modelDisplayNameForPath(library: ModelLibrary | null, path: string | null): string | null {
+  if (!library || !path) {
+    return null;
+  }
+
+  const entry = library.entries.find((candidate: SavedModelEntry) => candidate.path === path);
+  return entry?.displayName ?? null;
+}
 
 export function ResourceOverview() {
   const [mode, setMode] = useState<NodeMode>("host");
@@ -51,6 +75,16 @@ export function ResourceOverview() {
     host: false,
     connected: false,
   });
+  const [runtime, setRuntime] = useState<RuntimeConfig | null>(null);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const [library, setLibrary] = useState<ModelLibrary | null>(null);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [libraryBusy, setLibraryBusy] = useState(false);
+  const [aiState, setAIState] = useState<AIState | null>(null);
+  const [aiBusy, setAIBusy] = useState(false);
+  const [aiError, setAIError] = useState<string | null>(null);
+  const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
 
   useEffect(() => {
     if (!window.constellation?.getMainServerState) {
@@ -62,11 +96,35 @@ export function ResourceOverview() {
       if (response.ok) {
         setServerState(response.data);
         void refreshFirewallState();
-        return;
+      } else {
+        setServerError(response.error);
+      }
+    });
+
+    void refreshRuntime();
+    void refreshLibrary();
+  }, []);
+
+  useEffect(() => {
+    if (!window.constellation?.onDownloadProgress) {
+      return;
+    }
+
+    const unsubscribe = window.constellation.onDownloadProgress((progress) => {
+      setDownloads((current) => ({ ...current, [progress.id]: progress }));
+
+      if (progress.status === "completed" && progress.kind === "model") {
+        void refreshLibrary();
       }
 
-      setServerError(response.error);
+      if (progress.status === "completed" && progress.kind === "runtime") {
+        void refreshRuntime();
+      }
     });
+
+    return () => {
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -84,6 +142,20 @@ export function ResourceOverview() {
 
     return () => window.clearInterval(interval);
   }, [mode, serverState?.running, connectedServer?.url]);
+
+  useEffect(() => {
+    if (!serverState?.running) {
+      setAIState(null);
+      return;
+    }
+
+    void refreshAIState();
+    const interval = window.setInterval(() => {
+      void refreshAIState();
+    }, 4000);
+
+    return () => window.clearInterval(interval);
+  }, [serverState?.running]);
 
   async function handleScan() {
     if (!window.constellation?.scanHardware) {
@@ -463,6 +535,252 @@ export function ResourceOverview() {
     }
   }
 
+  async function refreshRuntime() {
+    if (!window.constellation?.getRuntimeConfig) {
+      return;
+    }
+
+    const response = await window.constellation.getRuntimeConfig();
+
+    if (response.ok) {
+      setRuntime(response.data);
+      setRuntimeError(null);
+    } else {
+      setRuntimeError(response.error);
+    }
+  }
+
+  async function refreshLibrary() {
+    if (!window.constellation?.listModels) {
+      return;
+    }
+
+    const response = await window.constellation.listModels();
+
+    if (response.ok) {
+      setLibrary(response.data);
+      setLibraryError(null);
+    } else {
+      setLibraryError(response.error);
+    }
+  }
+
+  const refreshAIState = useCallback(async () => {
+    if (!window.constellation?.getAIState) {
+      return;
+    }
+
+    const response = await window.constellation.getAIState();
+
+    if (response.ok) {
+      setAIState(response.data);
+      setAIError(null);
+    } else {
+      setAIState(null);
+      setAIError(response.error);
+    }
+  }, []);
+
+  const handlePickRuntime = useCallback(async () => {
+    if (!window.constellation?.pickRuntime) {
+      return;
+    }
+
+    setRuntimeBusy(true);
+    setRuntimeError(null);
+
+    try {
+      const response = await window.constellation.pickRuntime();
+
+      if (response.ok) {
+        setRuntime(response.data);
+      } else {
+        setRuntimeError(response.error);
+      }
+    } finally {
+      setRuntimeBusy(false);
+    }
+  }, []);
+
+  const handleClearRuntime = useCallback(async () => {
+    if (!window.constellation?.clearRuntime) {
+      return;
+    }
+
+    setRuntimeBusy(true);
+    setRuntimeError(null);
+
+    try {
+      const response = await window.constellation.clearRuntime();
+
+      if (response.ok) {
+        setRuntime(response.data);
+      } else {
+        setRuntimeError(response.error);
+      }
+    } finally {
+      setRuntimeBusy(false);
+    }
+  }, []);
+
+  const handleOpenReleases = useCallback(() => {
+    void window.constellation?.openExternal("https://github.com/ggml-org/llama.cpp/releases");
+  }, []);
+
+  const handlePickModel = useCallback(async () => {
+    if (!window.constellation?.pickModelFile) {
+      return;
+    }
+
+    setLibraryBusy(true);
+    setLibraryError(null);
+
+    try {
+      const response = await window.constellation.pickModelFile();
+
+      if (response.ok) {
+        setLibrary(response.data);
+      } else {
+        setLibraryError(response.error);
+      }
+    } finally {
+      setLibraryBusy(false);
+    }
+  }, []);
+
+  const handleSelectModel = useCallback(async (path: string) => {
+    if (!window.constellation?.selectModel) {
+      return;
+    }
+
+    setLibraryBusy(true);
+    setLibraryError(null);
+
+    try {
+      const response = await window.constellation.selectModel(path);
+
+      if (response.ok) {
+        setLibrary(response.data);
+      } else {
+        setLibraryError(response.error);
+      }
+    } finally {
+      setLibraryBusy(false);
+    }
+  }, []);
+
+  const handleRemoveModel = useCallback(async (path: string) => {
+    if (!window.constellation?.removeModelEntry) {
+      return;
+    }
+
+    setLibraryBusy(true);
+    setLibraryError(null);
+
+    try {
+      const response = await window.constellation.removeModelEntry(path);
+
+      if (response.ok) {
+        setLibrary(response.data);
+      } else {
+        setLibraryError(response.error);
+      }
+    } finally {
+      setLibraryBusy(false);
+    }
+  }, []);
+
+  const handleDownloadRecommended = useCallback(
+    async (model: RecommendedModel) => {
+      if (!window.constellation?.startDownload) {
+        return;
+      }
+
+      const id = downloadIdForModel(model);
+
+      const response = await window.constellation.startDownload({
+        id,
+        kind: "model",
+        url: model.url,
+        destinationName: model.fileName,
+      });
+
+      if (response.ok) {
+        setDownloads((current) => ({ ...current, [response.data.id]: response.data }));
+      } else {
+        setLibraryError(response.error);
+      }
+    },
+    [],
+  );
+
+  const handleCancelDownload = useCallback(async (id: string) => {
+    if (!window.constellation?.cancelDownload) {
+      return;
+    }
+
+    await window.constellation.cancelDownload(id);
+  }, []);
+
+  const handleLoadAI = useCallback(
+    async (options: { nGpuLayers: number; contextSize: number }) => {
+      if (!window.constellation?.loadAIModel) {
+        setAIError("Desktop bridge is unavailable.");
+        return;
+      }
+
+      if (!library?.lastModelPath) {
+        setAIError("Select a model first.");
+        return;
+      }
+
+      setAIBusy(true);
+      setAIError(null);
+
+      try {
+        const response = await window.constellation.loadAIModel({
+          modelPath: library.lastModelPath,
+          nGpuLayers: options.nGpuLayers,
+          contextSize: options.contextSize,
+        });
+
+        if (response.ok) {
+          setAIState(response.data);
+        } else {
+          setAIError(response.error);
+        }
+      } finally {
+        setAIBusy(false);
+      }
+    },
+    [library?.lastModelPath],
+  );
+
+  const handleUnloadAI = useCallback(async () => {
+    if (!window.constellation?.unloadAIModel) {
+      return;
+    }
+
+    setAIBusy(true);
+    setAIError(null);
+
+    try {
+      const response = await window.constellation.unloadAIModel();
+
+      if (response.ok) {
+        setAIState(response.data);
+      } else {
+        setAIError(response.error);
+      }
+    } finally {
+      setAIBusy(false);
+    }
+  }, []);
+
+  const runtimeDownload = downloads["runtime:current"] ?? null;
+  const selectedPath = library?.lastModelPath ?? null;
+  const selectedModelName = modelDisplayNameForPath(library, selectedPath);
+
   return (
     <section className="resource-page">
       <HardwareScanner error={error} onScan={handleScan} snapshot={snapshot} status={status} />
@@ -504,6 +822,38 @@ export function ResourceOverview() {
             onStartSharing={handleStartSharing}
             onStop={handleStopServer}
             state={serverState}
+          />
+          <RuntimePanel
+            busy={runtimeBusy}
+            error={runtimeError}
+            onClear={handleClearRuntime}
+            onOpenReleases={handleOpenReleases}
+            onPick={handlePickRuntime}
+            runtime={runtime}
+            runtimeDownload={runtimeDownload}
+          />
+          <ModelPanel
+            busy={libraryBusy}
+            downloads={downloads}
+            error={libraryError}
+            hardware={snapshot}
+            library={library}
+            onAddCustom={handlePickModel}
+            onCancelDownload={handleCancelDownload}
+            onDownloadRecommended={handleDownloadRecommended}
+            onRemove={handleRemoveModel}
+            onSelect={handleSelectModel}
+            selectedPath={selectedPath}
+          />
+          <InferencePanel
+            aiState={aiState}
+            busy={aiBusy}
+            error={aiError}
+            hardware={snapshot}
+            onLoad={handleLoadAI}
+            onUnload={handleUnloadAI}
+            selectedModelName={selectedModelName}
+            selectedModelPath={selectedPath}
           />
           <ChatPanel
             busy={chatBusyByTarget.host}

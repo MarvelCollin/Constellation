@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { IpcRendererEvent } from "electron";
 import type {
   ChatFetchRequest,
   ChatResponse,
@@ -13,6 +14,19 @@ import type {
   StartMainServerOptions,
   ZrokEnableResponse,
 } from "../shared/hardware";
+import type {
+  AIChatEndpointResponse,
+  AILoadOptions,
+  AILoadResponse,
+  AIStateResponse,
+  AIUnloadResponse,
+  DownloadCancelResponse,
+  DownloadProgress,
+  DownloadStartRequest,
+  DownloadStartResponse,
+  ModelLibraryResponse,
+  RuntimeConfigResponse,
+} from "../shared/ai";
 
 contextBridge.exposeInMainWorld("constellation", {
   platform: process.platform,
@@ -31,4 +45,25 @@ contextBridge.exposeInMainWorld("constellation", {
   startZrokTunnel: (): Promise<MainServerResponse> => ipcRenderer.invoke("main-server:start-tunnel"),
   stopMainServer: (): Promise<MainServerResponse> => ipcRenderer.invoke("main-server:stop"),
   stopZrokTunnel: (): Promise<MainServerResponse> => ipcRenderer.invoke("main-server:stop-tunnel"),
+  getRuntimeConfig: (): Promise<RuntimeConfigResponse> => ipcRenderer.invoke("runtime:get"),
+  pickRuntime: (): Promise<RuntimeConfigResponse> => ipcRenderer.invoke("runtime:pick"),
+  clearRuntime: (): Promise<RuntimeConfigResponse> => ipcRenderer.invoke("runtime:clear"),
+  listModels: (): Promise<ModelLibraryResponse> => ipcRenderer.invoke("models:list"),
+  pickModelFile: (): Promise<ModelLibraryResponse> => ipcRenderer.invoke("models:pick"),
+  removeModelEntry: (path: string): Promise<ModelLibraryResponse> => ipcRenderer.invoke("models:remove", path),
+  selectModel: (path: string): Promise<ModelLibraryResponse> => ipcRenderer.invoke("models:select", path),
+  getAIState: (): Promise<AIStateResponse> => ipcRenderer.invoke("ai:state"),
+  loadAIModel: (options: AILoadOptions): Promise<AILoadResponse> => ipcRenderer.invoke("ai:load", options),
+  unloadAIModel: (): Promise<AIUnloadResponse> => ipcRenderer.invoke("ai:unload"),
+  getAIChatEndpoint: (): Promise<AIChatEndpointResponse> => ipcRenderer.invoke("ai:chat-endpoint"),
+  startDownload: (request: DownloadStartRequest): Promise<DownloadStartResponse> =>
+    ipcRenderer.invoke("downloads:start", request),
+  cancelDownload: (id: string): Promise<DownloadCancelResponse> => ipcRenderer.invoke("downloads:cancel", id),
+  openExternal: (url: string): Promise<{ ok: true } | { ok: false; error: string }> =>
+    ipcRenderer.invoke("shell:open-external", url),
+  onDownloadProgress: (listener: (progress: DownloadProgress) => void) => {
+    const handler = (_event: IpcRendererEvent, progress: DownloadProgress) => listener(progress);
+    ipcRenderer.on("download:progress", handler);
+    return () => ipcRenderer.removeListener("download:progress", handler);
+  },
 });

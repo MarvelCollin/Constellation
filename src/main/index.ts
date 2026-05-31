@@ -1,11 +1,11 @@
-import { app, BrowserWindow, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import type { IpcMainInvokeEvent } from "electron";
 import { connect as connectSocket } from "node:net";
 import { hostname, networkInterfaces, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type {
   ChatFetchRequest,
   ChatMessage,
@@ -25,10 +25,32 @@ import type {
   StartMainServerOptions,
   ZrokEnableResponse,
 } from "../shared/hardware";
+import type {
+  AIChatEndpointResponse,
+  AILoadOptions,
+  AILoadResponse,
+  AIState,
+  AIStateResponse,
+  AIUnloadResponse,
+  DownloadCancelResponse,
+  DownloadProgress,
+  DownloadStartRequest,
+  DownloadStartResponse,
+  ModelLibrary,
+  ModelLibraryResponse,
+  RuntimeConfig,
+  RuntimeConfigResponse,
+  SavedModelEntry,
+} from "../shared/ai";
 
 let mainServerProcess: ChildProcessWithoutNullStreams | null = null;
 let zrokTunnelProcess: ChildProcessWithoutNullStreams | null = null;
-let connectedServer: { url: string; token: string; peerName: string } | null = null;
+let connectedServer: { url: string; token: string; peerName: string; peerId: string } | null = null;
+let hostPeerId: string | null = null;
+let hostHeartbeatTimer: NodeJS.Timeout | null = null;
+let connectedHeartbeatTimer: NodeJS.Timeout | null = null;
+
+const HEARTBEAT_INTERVAL_MS = 5000;
 let mainServerState: MainServerState = {
   running: false,
   exposure: "internet",
@@ -50,6 +72,366 @@ const runtimePath = join(tmpdir(), "constellation-runtime", String(process.pid))
 mkdirSync(join(runtimePath, "session"), { recursive: true });
 app.commandLine.appendSwitch("disk-cache-dir", join(runtimePath, "cache"));
 app.setPath("sessionData", join(runtimePath, "session"));
+
+type ConstellationConfig = {
+  runtimePath: string | null;
+  modelPaths: string[];
+  lastModelPath: string | null;
+};
+
+type ActiveDownload = {
+  id: string;
+  kind: "runtime" | "model";
+  url: string;
+  destination: string;
+  status: "active" | "completed" | "error";
+  receivedBytes: number;
+  totalBytes: number | null;
+  message: string | null;
+  controller: AbortController;
+};
+
+const downloads = new Map<string, ActiveDownload>();
+let mainWindow: BrowserWindow | null = null;
+
+function userDataDir() {
+  return app.getPath("userData");
+}
+
+function configPath() {
+  return join(userDataDir(), "constellation.json");
+}
+
+function modelsDir() {
+  const dir = join(userDataDir(), "models");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function runtimeDir() {
+  const dir = join(userDataDir(), "runtime");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function defaultConfig(): ConstellationConfig {
+  return { runtimePath: null, modelPaths: [], lastModelPath: null };
+}
+
+function readConfig(): ConstellationConfig {
+  if (!existsSync(configPath())) {
+    return defaultConfig();
+  }
+
+  const raw = readFileSync(configPath(), "utf8");
+  const parsed = JSON.parse(raw) as Partial<ConstellationConfig>;
+
+  return {
+    runtimePath: typeof parsed.runtimePath === "string" ? parsed.runtimePath : null,
+    modelPaths: Array.isArray(parsed.modelPaths) ? parsed.modelPaths.filter((value): value is string => typeof value === "string") : [],
+    lastModelPath: typeof parsed.lastModelPath === "string" ? parsed.lastModelPath : null,
+  };
+}
+
+function writeConfig(config: ConstellationConfig): void {
+  mkdirSync(userDataDir(), { recursive: true });
+  writeFileSync(configPath(), JSON.stringify(config, null, 2), "utf8");
+}
+
+function appConfig(): ConstellationConfig {
+  return readConfig();
+}
+
+function persistRuntimePath(path: string | null) {
+  const config = readConfig();
+  config.runtimePath = path;
+  writeConfig(config);
+}
+
+function addModelPath(path: string) {
+  const config = readConfig();
+
+  if (!config.modelPaths.includes(path)) {
+    config.modelPaths = [...config.modelPaths, path];
+  }
+
+  config.lastModelPath = path;
+  writeConfig(config);
+}
+
+function removeModelPath(path: string) {
+  const config = readConfig();
+  config.modelPaths = config.modelPaths.filter((entry) => entry !== path);
+
+  if (config.lastModelPath === path) {
+    config.lastModelPath = null;
+  }
+
+  writeConfig(config);
+}
+
+function setLastModelPath(path: string) {
+  const config = readConfig();
+  config.lastModelPath = path;
+
+  if (!config.modelPaths.includes(path)) {
+    config.modelPaths = [...config.modelPaths, path];
+  }
+
+  writeConfig(config);
+}
+
+function describeModel(path: string): SavedModelEntry {
+  let fileSizeBytes: number | null = null;
+
+  if (existsSync(path)) {
+    fileSizeBytes = statSync(path).size;
+  }
+
+  return {
+    path,
+    displayName: basename(path).replace(/\.gguf$/i, ""),
+    fileSizeBytes,
+  };
+}
+
+function scanDiscoveredModels(): string[] {
+  const dir = modelsDir();
+  const entries = readdirSync(dir);
+  return entries
+    .filter((entry) => entry.toLowerCase().endsWith(".gguf"))
+    .map((entry) => join(dir, entry));
+}
+
+function buildModelLibrary(): ModelLibrary {
+  const config = readConfig();
+  const discovered = scanDiscoveredModels();
+  const combined = new Set<string>([...config.modelPaths, ...discovered]);
+  const entries = Array.from(combined)
+    .map(describeModel)
+    .filter((entry) => entry.fileSizeBytes !== null)
+    .sort((left, right) => left.displayName.localeCompare(right.displayName));
+
+  return {
+    modelsDir: modelsDir(),
+    entries,
+    lastModelPath: config.lastModelPath,
+  };
+}
+
+function buildRuntimeConfig(): RuntimeConfig {
+  const config = readConfig();
+  const path = config.runtimePath;
+  return {
+    path,
+    exists: typeof path === "string" && existsSync(path),
+  };
+}
+
+function emitDownload(download: ActiveDownload) {
+  const payload: DownloadProgress = {
+    id: download.id,
+    kind: download.kind,
+    url: download.url,
+    destination: download.destination,
+    status: download.status,
+    receivedBytes: download.receivedBytes,
+    totalBytes: download.totalBytes,
+    message: download.message,
+  };
+
+  mainWindow?.webContents.send("download:progress", payload);
+}
+
+function downloadSnapshot(download: ActiveDownload): DownloadProgress {
+  return {
+    id: download.id,
+    kind: download.kind,
+    url: download.url,
+    destination: download.destination,
+    status: download.status,
+    receivedBytes: download.receivedBytes,
+    totalBytes: download.totalBytes,
+    message: download.message,
+  };
+}
+
+async function performDownload(download: ActiveDownload, destinationDir: string) {
+  try {
+    const response = await fetch(download.url, {
+      method: "GET",
+      redirect: "follow",
+      signal: download.controller.signal,
+    });
+
+    if (!response.ok || response.body === null) {
+      download.status = "error";
+      download.message = `Download failed with status ${response.status}`;
+      emitDownload(download);
+      return;
+    }
+
+    const totalHeader = response.headers.get("Content-Length");
+    download.totalBytes = totalHeader ? Number.parseInt(totalHeader, 10) : null;
+
+    mkdirSync(destinationDir, { recursive: true });
+    const finalPath = join(destinationDir, basename(download.destination));
+    download.destination = finalPath;
+
+    const fileStream = createWriteStream(finalPath);
+    let lastEmit = 0;
+    const reader = response.body.getReader();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          break;
+        }
+
+        if (value && value.length > 0) {
+          const buffer = Buffer.from(value);
+
+          if (!fileStream.write(buffer)) {
+            await new Promise<void>((resolve) => fileStream.once("drain", resolve));
+          }
+
+          download.receivedBytes += buffer.length;
+          const now = Date.now();
+
+          if (now - lastEmit >= 200) {
+            lastEmit = now;
+            emitDownload(download);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+      await new Promise<void>((resolve, reject) => {
+        fileStream.end((error?: NodeJS.ErrnoException | null) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+
+          resolve();
+        });
+      });
+    }
+
+    download.status = "completed";
+    download.message = "Download complete";
+    emitDownload(download);
+
+    if (download.kind === "runtime") {
+      persistRuntimePath(finalPath);
+    } else {
+      addModelPath(finalPath);
+    }
+  } catch (error) {
+    if (existsSync(download.destination)) {
+      try {
+        unlinkSync(download.destination);
+      } catch {
+        return;
+      }
+    }
+
+    download.status = "error";
+    download.message = error instanceof Error ? error.message : "Download failed";
+    emitDownload(download);
+  } finally {
+    setTimeout(() => downloads.delete(download.id), 5000);
+  }
+}
+
+async function localServerRequest(path: string, init?: RequestInit): Promise<unknown> {
+  if (!mainServerState.token || !mainServerProcess) {
+    throw new Error("Main server is not running");
+  }
+
+  const url = `http://127.0.0.1:${mainServerState.port}${path}`;
+  const headers = new Headers(init?.headers);
+  headers.set("Authorization", `Bearer ${mainServerState.token}`);
+
+  if (init?.body) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const response = await fetch(url, { ...init, headers });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `Request failed with status ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function isAIState(value: unknown): value is AIState {
+  return (
+    isRecord(value) &&
+    typeof value.running === "boolean" &&
+    typeof value.ready === "boolean" &&
+    (typeof value.modelPath === "string" || value.modelPath === null) &&
+    (typeof value.runtimePath === "string" || value.runtimePath === null) &&
+    typeof value.nGpuLayers === "number" &&
+    typeof value.contextSize === "number" &&
+    Array.isArray(value.rpcPeers) &&
+    typeof value.host === "string" &&
+    typeof value.port === "number" &&
+    Array.isArray(value.log)
+  );
+}
+
+function parseLoadOptions(value: unknown): AILoadOptions | null {
+  if (
+    !isRecord(value) ||
+    typeof value.modelPath !== "string" ||
+    typeof value.nGpuLayers !== "number" ||
+    typeof value.contextSize !== "number"
+  ) {
+    return null;
+  }
+
+  if (value.modelPath.length < 1) {
+    return null;
+  }
+
+  if (value.nGpuLayers < 0 || value.nGpuLayers > 999) {
+    return null;
+  }
+
+  if (value.contextSize < 256 || value.contextSize > 131072) {
+    return null;
+  }
+
+  return {
+    modelPath: value.modelPath,
+    nGpuLayers: Math.floor(value.nGpuLayers),
+    contextSize: Math.floor(value.contextSize),
+  };
+}
+
+function parseDownloadStartRequest(value: unknown): DownloadStartRequest | null {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    (value.kind !== "runtime" && value.kind !== "model") ||
+    typeof value.url !== "string" ||
+    typeof value.destinationName !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    id: value.id,
+    kind: value.kind,
+    url: value.url,
+    destinationName: value.destinationName,
+  };
+}
 
 function loadEnvFile() {
   const envPath = join(process.cwd(), ".env");
@@ -86,7 +468,9 @@ function isGpuInfo(value: unknown): boolean {
     isRecord(value) &&
     typeof value.name === "string" &&
     typeof value.memory_mb === "number" &&
-    typeof value.driver === "string"
+    typeof value.memory_free_mb === "number" &&
+    typeof value.driver === "string" &&
+    typeof value.vendor === "string"
   );
 }
 
@@ -97,8 +481,10 @@ function isHardwareSnapshot(value: unknown): value is HardwareSnapshot {
     typeof value.python_version === "string" &&
     (typeof value.cpu_count === "number" || value.cpu_count === null) &&
     (typeof value.memory_bytes === "number" || value.memory_bytes === null) &&
+    (typeof value.memory_free_bytes === "number" || value.memory_free_bytes === null) &&
     (typeof value.storage_bytes === "number" || value.storage_bytes === null) &&
     (typeof value.storage_free_bytes === "number" || value.storage_free_bytes === null) &&
+    typeof value.gpu_vendor === "string" &&
     Array.isArray(value.gpus) &&
     value.gpus.every(isGpuInfo)
   );
@@ -109,7 +495,8 @@ function isChatPeer(value: unknown): value is ChatPeer {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
-    typeof value.lastSeen === "string"
+    typeof value.lastSeen === "string" &&
+    typeof value.online === "boolean"
   );
 }
 
@@ -353,11 +740,74 @@ function connectFailureMessage(error: unknown, url: string) {
   ].join("\n");
 }
 
-async function registerPeer(url: string, token: string, name: string): Promise<void> {
-  await serverJsonRequest(url, token, "/api/peers", {
+async function registerPeer(url: string, token: string, name: string): Promise<string> {
+  const payload = await serverJsonRequest(url, token, "/api/peers", {
     body: JSON.stringify({ name }),
     method: "POST",
   });
+
+  if (
+    !isRecord(payload) ||
+    payload.ok !== true ||
+    !isRecord(payload.data) ||
+    !isRecord(payload.data.peer) ||
+    typeof payload.data.peer.id !== "string"
+  ) {
+    throw new Error("Peer registration response did not include an id");
+  }
+
+  return payload.data.peer.id;
+}
+
+async function sendHeartbeat(url: string, token: string, peerId: string): Promise<void> {
+  await serverJsonRequest(url, token, "/api/peers/heartbeat", {
+    body: JSON.stringify({ id: peerId }),
+    method: "POST",
+  });
+}
+
+function startHostHeartbeat() {
+  stopHostHeartbeat();
+
+  if (!hostPeerId || !mainServerState.token) {
+    return;
+  }
+
+  const url = `http://127.0.0.1:${mainServerState.port}`;
+  const token = mainServerState.token;
+  const peerId = hostPeerId;
+
+  hostHeartbeatTimer = setInterval(() => {
+    void sendHeartbeat(url, token, peerId).catch(() => undefined);
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHostHeartbeat() {
+  if (hostHeartbeatTimer) {
+    clearInterval(hostHeartbeatTimer);
+    hostHeartbeatTimer = null;
+  }
+}
+
+function startConnectedHeartbeat() {
+  stopConnectedHeartbeat();
+
+  if (!connectedServer) {
+    return;
+  }
+
+  const { url, token, peerId } = connectedServer;
+
+  connectedHeartbeatTimer = setInterval(() => {
+    void sendHeartbeat(url, token, peerId).catch(() => undefined);
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopConnectedHeartbeat() {
+  if (connectedHeartbeatTimer) {
+    clearInterval(connectedHeartbeatTimer);
+    connectedHeartbeatTimer = null;
+  }
 }
 
 function scanHardware(): Promise<HardwareScanResponse> {
@@ -437,6 +887,8 @@ function cleanupZrokTunnelProcess() {
 
 function cleanupMainServerProcesses() {
   cleanupZrokTunnelProcess();
+  stopHostHeartbeat();
+  hostPeerId = null;
 
   if (mainServerProcess) {
     mainServerProcess.kill();
@@ -984,7 +1436,11 @@ async function startMainServer(_event: IpcMainInvokeEvent, value: unknown): Prom
         tunnelNote: null,
       };
       void registerPeer(`http://127.0.0.1:${port}`, token, "Host")
-        .then(() => finish({ ok: true, data: currentMainServerState() }))
+        .then((peerId) => {
+          hostPeerId = peerId;
+          startHostHeartbeat();
+          finish({ ok: true, data: currentMainServerState() });
+        })
         .catch((error: unknown) => {
           child.kill();
           mainServerProcess = null;
@@ -1011,6 +1467,8 @@ async function startMainServer(_event: IpcMainInvokeEvent, value: unknown): Prom
     child.on("exit", (code: number | null) => {
       if (mainServerProcess === child) {
         mainServerProcess = null;
+        stopHostHeartbeat();
+        hostPeerId = null;
         resetMainServerState();
       }
 
@@ -1104,8 +1562,10 @@ async function connectToMainServer(_event: IpcMainInvokeEvent, value: unknown): 
       return { ok: false, error: "Server returned an unexpected hardware response." };
     }
 
-    connectedServer = { url: request.url, token: request.token, peerName: nodeName() };
-    await registerPeer(request.url, request.token, connectedServer.peerName);
+    const peerName = nodeName();
+    const peerId = await registerPeer(request.url, request.token, peerName);
+    connectedServer = { url: request.url, token: request.token, peerName, peerId };
+    startConnectedHeartbeat();
 
     return { ok: true, data: { url: request.url, hardware: payload.data } };
   } catch (error) {
@@ -1119,8 +1579,242 @@ function stopMainServer(): MainServerResponse {
   return { ok: true, data: currentMainServerState() };
 }
 
+function getRuntimeConfig(): RuntimeConfigResponse {
+  return { ok: true, data: buildRuntimeConfig() };
+}
+
+async function pickRuntime(_event: IpcMainInvokeEvent): Promise<RuntimeConfigResponse> {
+  const owner = mainWindow;
+
+  if (owner === null) {
+    return { ok: false, error: "Main window is not available." };
+  }
+
+  const result = await dialog.showOpenDialog(owner, {
+    title: "Choose llama-server executable",
+    properties: ["openFile"],
+    filters: process.platform === "win32"
+      ? [{ name: "Executable", extensions: ["exe"] }]
+      : [{ name: "Executable", extensions: ["*"] }],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { ok: true, data: buildRuntimeConfig() };
+  }
+
+  const chosen = result.filePaths[0];
+
+  if (!existsSync(chosen)) {
+    return { ok: false, error: "Selected file does not exist." };
+  }
+
+  persistRuntimePath(chosen);
+  return { ok: true, data: buildRuntimeConfig() };
+}
+
+function clearRuntime(): RuntimeConfigResponse {
+  persistRuntimePath(null);
+  return { ok: true, data: buildRuntimeConfig() };
+}
+
+function listModels(): ModelLibraryResponse {
+  return { ok: true, data: buildModelLibrary() };
+}
+
+async function pickModelFile(_event: IpcMainInvokeEvent): Promise<ModelLibraryResponse> {
+  const owner = mainWindow;
+
+  if (owner === null) {
+    return { ok: false, error: "Main window is not available." };
+  }
+
+  const result = await dialog.showOpenDialog(owner, {
+    title: "Choose GGUF model file",
+    properties: ["openFile"],
+    filters: [{ name: "GGUF model", extensions: ["gguf"] }],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { ok: true, data: buildModelLibrary() };
+  }
+
+  const chosen = result.filePaths[0];
+
+  if (!existsSync(chosen)) {
+    return { ok: false, error: "Selected file does not exist." };
+  }
+
+  addModelPath(chosen);
+  return { ok: true, data: buildModelLibrary() };
+}
+
+function removeModelEntry(_event: IpcMainInvokeEvent, value: unknown): ModelLibraryResponse {
+  if (typeof value !== "string") {
+    return { ok: false, error: "Model path is required." };
+  }
+
+  removeModelPath(value);
+  return { ok: true, data: buildModelLibrary() };
+}
+
+function selectModel(_event: IpcMainInvokeEvent, value: unknown): ModelLibraryResponse {
+  if (typeof value !== "string") {
+    return { ok: false, error: "Model path is required." };
+  }
+
+  setLastModelPath(value);
+  return { ok: true, data: buildModelLibrary() };
+}
+
+async function getAIState(): Promise<AIStateResponse> {
+  if (!mainServerProcess || !mainServerState.token) {
+    return { ok: false, error: "Start the server before using AI." };
+  }
+
+  try {
+    const payload = await localServerRequest("/api/ai/state");
+
+    if (!isRecord(payload) || payload.ok !== true || !isAIState(payload.data)) {
+      return { ok: false, error: "Unexpected AI state response." };
+    }
+
+    return { ok: true, data: payload.data };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Could not fetch AI state." };
+  }
+}
+
+async function loadAIModel(_event: IpcMainInvokeEvent, value: unknown): Promise<AILoadResponse> {
+  if (!mainServerProcess) {
+    return { ok: false, error: "Start the server before loading a model." };
+  }
+
+  const options = parseLoadOptions(value);
+
+  if (options === null) {
+    return { ok: false, error: "Invalid load options." };
+  }
+
+  const runtime = buildRuntimeConfig();
+
+  if (runtime.path === null || !runtime.exists) {
+    return { ok: false, error: "Configure llama-server executable first." };
+  }
+
+  try {
+    const payload = await localServerRequest("/api/ai/load", {
+      method: "POST",
+      body: JSON.stringify({
+        runtimePath: runtime.path,
+        modelPath: options.modelPath,
+        nGpuLayers: options.nGpuLayers,
+        contextSize: options.contextSize,
+        rpcPeers: [],
+      }),
+    });
+
+    if (!isRecord(payload) || payload.ok !== true || !isAIState(payload.data)) {
+      return { ok: false, error: "Unexpected AI load response." };
+    }
+
+    setLastModelPath(options.modelPath);
+    return { ok: true, data: payload.data };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Could not load model." };
+  }
+}
+
+async function unloadAIModel(): Promise<AIUnloadResponse> {
+  if (!mainServerProcess) {
+    return { ok: false, error: "Server is not running." };
+  }
+
+  try {
+    const payload = await localServerRequest("/api/ai/unload", { method: "POST" });
+
+    if (!isRecord(payload) || payload.ok !== true || !isAIState(payload.data)) {
+      return { ok: false, error: "Unexpected AI unload response." };
+    }
+
+    return { ok: true, data: payload.data };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Could not unload model." };
+  }
+}
+
+function getAIChatEndpoint(): AIChatEndpointResponse {
+  if (!mainServerProcess || !mainServerState.token) {
+    return { ok: false, error: "Start the server before using AI chat." };
+  }
+
+  return {
+    ok: true,
+    data: {
+      url: `http://127.0.0.1:${mainServerState.port}/api/ai/chat`,
+      token: mainServerState.token,
+    },
+  };
+}
+
+function startDownload(_event: IpcMainInvokeEvent, value: unknown): DownloadStartResponse {
+  const request = parseDownloadStartRequest(value);
+
+  if (request === null) {
+    return { ok: false, error: "Invalid download request." };
+  }
+
+  if (downloads.has(request.id)) {
+    return { ok: false, error: "Download id is already in use." };
+  }
+
+  const destinationDir = request.kind === "runtime" ? runtimeDir() : modelsDir();
+  const destination = join(destinationDir, request.destinationName);
+
+  const download: ActiveDownload = {
+    id: request.id,
+    kind: request.kind,
+    url: request.url,
+    destination,
+    status: "active",
+    receivedBytes: 0,
+    totalBytes: null,
+    message: null,
+    controller: new AbortController(),
+  };
+
+  downloads.set(request.id, download);
+  emitDownload(download);
+  void performDownload(download, destinationDir);
+
+  return { ok: true, data: downloadSnapshot(download) };
+}
+
+function cancelDownload(_event: IpcMainInvokeEvent, value: unknown): DownloadCancelResponse {
+  if (typeof value !== "string") {
+    return { ok: false, error: "Download id is required." };
+  }
+
+  const download = downloads.get(value);
+
+  if (!download) {
+    return { ok: false, error: "Download not found." };
+  }
+
+  download.controller.abort();
+  return { ok: true };
+}
+
+function openExternal(_event: IpcMainInvokeEvent, value: unknown): { ok: true } | { ok: false; error: string } {
+  if (typeof value !== "string" || !/^https?:\/\//i.test(value)) {
+    return { ok: false, error: "Only http(s) links are allowed." };
+  }
+
+  void shell.openExternal(value);
+  return { ok: true };
+}
+
 function createWindow(): void {
-  const mainWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     width: 1280,
     height: 800,
     minWidth: 1024,
@@ -1135,12 +1829,19 @@ function createWindow(): void {
     },
   });
 
+  mainWindow = window;
+  window.on("closed", () => {
+    if (mainWindow === window) {
+      mainWindow = null;
+    }
+  });
+
   if (process.env.ELECTRON_RENDERER_URL) {
-    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+    void window.loadURL(process.env.ELECTRON_RENDERER_URL);
     return;
   }
 
-  void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
+  void window.loadFile(join(__dirname, "../renderer/index.html"));
 }
 
 void app.whenReady().then(() => {
@@ -1158,6 +1859,20 @@ void app.whenReady().then(() => {
   ipcMain.handle("main-server:start-tunnel", startZrokTunnel);
   ipcMain.handle("main-server:stop", stopMainServer);
   ipcMain.handle("main-server:stop-tunnel", stopZrokTunnel);
+  ipcMain.handle("runtime:get", getRuntimeConfig);
+  ipcMain.handle("runtime:pick", pickRuntime);
+  ipcMain.handle("runtime:clear", clearRuntime);
+  ipcMain.handle("models:list", listModels);
+  ipcMain.handle("models:pick", pickModelFile);
+  ipcMain.handle("models:remove", removeModelEntry);
+  ipcMain.handle("models:select", selectModel);
+  ipcMain.handle("ai:state", getAIState);
+  ipcMain.handle("ai:load", loadAIModel);
+  ipcMain.handle("ai:unload", unloadAIModel);
+  ipcMain.handle("ai:chat-endpoint", getAIChatEndpoint);
+  ipcMain.handle("downloads:start", startDownload);
+  ipcMain.handle("downloads:cancel", cancelDownload);
+  ipcMain.handle("shell:open-external", openExternal);
   createWindow();
 
   app.on("activate", () => {
@@ -1174,5 +1889,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  stopConnectedHeartbeat();
+  connectedServer = null;
   cleanupMainServerProcesses();
 });

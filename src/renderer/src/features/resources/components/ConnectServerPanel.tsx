@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ConnectMainServerRequest, ConnectedServerState } from "../../../../../shared/hardware";
-import { formatBytes, formatGpuMemory } from "../formatHardware";
+import { formatBytes, formatGpuMemory, formatVendor } from "../formatHardware";
 
 type ConnectServerPanelProps = {
   busy: boolean;
@@ -15,9 +15,11 @@ export function ConnectServerPanel({ busy, connection, error, onConnect }: Conne
   const canConnect = url.trim().length > 0 && token.trim().length >= 8;
   const statusText = connection ? "Connected to server" : "Not connected";
   const gpuText = connection?.hardware.gpus.length
-    ? connection.hardware.gpus.map((gpu) => `${gpu.name} (${formatGpuMemory(gpu.memory_mb)})`).join(", ")
+    ? connection.hardware.gpus
+        .map((gpu) => `${gpu.name} (${gpu.memory_mb > 0 ? formatGpuMemory(gpu.memory_mb) : formatVendor(gpu.vendor)})`)
+        .join(", ")
     : connection
-      ? "No NVIDIA GPU detected"
+      ? formatVendor(connection.hardware.gpu_vendor)
       : "Waiting";
 
   return (
@@ -77,7 +79,11 @@ export function ConnectServerPanel({ busy, connection, error, onConnect }: Conne
         </div>
         <div>
           <span>Remote RAM</span>
-          <strong>{formatBytes(connection?.hardware.memory_bytes)}</strong>
+          <strong>
+            {connection
+              ? `${formatBytes(connection.hardware.memory_free_bytes)} free of ${formatBytes(connection.hardware.memory_bytes)}`
+              : "Waiting"}
+          </strong>
         </div>
         <div>
           <span>Remote GPU</span>

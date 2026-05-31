@@ -22,3 +22,16 @@ export function formatGpuMemory(memoryMb: number) {
 
   return `${memoryMb} MB`;
 }
+
+export function formatVendor(vendor: string) {
+  const lookup: Record<string, string> = {
+    nvidia: "NVIDIA",
+    amd: "AMD",
+    intel: "Intel",
+    apple: "Apple",
+    unknown: "Unknown",
+    none: "No dedicated GPU",
+  };
+
+  return lookup[vendor] ?? vendor;
+}
