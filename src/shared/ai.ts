@@ -19,6 +19,7 @@ export type AILoadOptions = {
   modelPath: string;
   nGpuLayers: number;
   contextSize: number;
+  rpcPeers?: string[];
 };
 
 export type AILoadResponse = AIStateResponse;
@@ -83,4 +84,41 @@ export type AIChatEndpoint = {
 
 export type AIChatEndpointResponse =
   | { ok: true; data: AIChatEndpoint }
+  | { ok: false; error: string };
+
+export type PoolOffer = {
+  id: string;
+  peerId: string;
+  peerName: string;
+  rpcUrl: string;
+  vramMb: number;
+  ramMb: number;
+  createdAt: string;
+  lastSeen: string;
+  online: boolean;
+};
+
+export type PoolMembersResponse =
+  | { ok: true; data: PoolOffer[] }
+  | { ok: false; error: string };
+
+export type LendOptions = {
+  port: number;
+  vramMb: number;
+  ramMb: number;
+};
+
+export type LendState = {
+  running: boolean;
+  port: number;
+  rpcUrl: string | null;
+  vramMb: number;
+  ramMb: number;
+  offerId: string | null;
+  message: string | null;
+  log: string[];
+};
+
+export type LendStateResponse =
+  | { ok: true; data: LendState }
   | { ok: false; error: string };

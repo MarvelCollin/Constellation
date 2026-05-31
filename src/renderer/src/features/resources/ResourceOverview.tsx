@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
   ChatSnapshot,
   ChatTarget,
@@ -12,7 +12,9 @@ import type {
 import type {
   AIState,
   DownloadProgress,
+  LendState,
   ModelLibrary,
+  PoolOffer,
   RuntimeConfig,
   SavedModelEntry,
 } from "../../../../shared/ai";
@@ -25,9 +27,46 @@ import { InferencePanel } from "../ai/InferencePanel";
 import { ModelPanel } from "../ai/ModelPanel";
 import { RuntimePanel } from "../ai/RuntimePanel";
 import type { RecommendedModel } from "../ai/recommendedModels";
+import { LendResourcesPanel } from "../pool/LendResourcesPanel";
+import { PoolPanel } from "../pool/PoolPanel";
+import { StatusStrip } from "../status/StatusStrip";
 
 type ScanStatus = "idle" | "scanning" | "ready" | "error";
 type NodeMode = "host" | "connect";
+
+const SELECTED_PEERS_STORAGE_KEY = "constellation:selectedPeerIds";
+
+function loadSelectedPeerIds(): Set<string> {
+  if (typeof window === "undefined") {
+    return new Set();
+  }
+
+  const raw = window.localStorage.getItem(SELECTED_PEERS_STORAGE_KEY);
+
+  if (!raw) {
+    return new Set();
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+
+    if (!Array.isArray(parsed)) {
+      return new Set();
+    }
+
+    return new Set(parsed.filter((value): value is string => typeof value === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+function persistSelectedPeerIds(value: Set<string>) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(SELECTED_PEERS_STORAGE_KEY, JSON.stringify(Array.from(value)));
+}
 
 function downloadIdForModel(model: RecommendedModel) {
   return `model:${model.id}`;
@@ -40,6 +79,12 @@ function modelDisplayNameForPath(library: ModelLibrary | null, path: string | nu
 
   const entry = library.entries.find((candidate: SavedModelEntry) => candidate.path === path);
   return entry?.displayName ?? null;
+}
+
+function selectedRpcUrls(offers: PoolOffer[], selected: Set<string>): string[] {
+  return offers
+    .filter((offer) => offer.online && selected.has(offer.peerId))
+    .map((offer) => offer.rpcUrl);
 }
 
 export function ResourceOverview() {
@@ -85,6 +130,14 @@ export function ResourceOverview() {
   const [aiBusy, setAIBusy] = useState(false);
   const [aiError, setAIError] = useState<string | null>(null);
   const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
+  const [poolOffers, setPoolOffers] = useState<PoolOffer[]>([]);
+  const [poolBusy, setPoolBusy] = useState(false);
+  const [poolError, setPoolError] = useState<string | null>(null);
+  const [selectedPeerIds, setSelectedPeerIds] = useState<Set<string>>(() => loadSelectedPeerIds());
+  const [applyPoolBusy, setApplyPoolBusy] = useState(false);
+  const [lendState, setLendState] = useState<LendState | null>(null);
+  const [lendBusy, setLendBusy] = useState(false);
+  const [lendError, setLendError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!window.constellation?.getMainServerState) {
@@ -101,9 +154,25 @@ export function ResourceOverview() {
       }
     });
 
+    void handleScan();
     void refreshRuntime();
     void refreshLibrary();
   }, []);
+
+  useEffect(() => {
+    if (!library) {
+      return;
+    }
+
+    if (library.lastModelPath === null && library.entries.length > 0) {
+      const firstPath = library.entries[0].path;
+      void window.constellation?.selectModel(firstPath).then((response) => {
+        if (response.ok) {
+          setLibrary(response.data);
+        }
+      });
+    }
+  }, [library?.entries.length, library?.lastModelPath]);
 
   useEffect(() => {
     if (!window.constellation?.onDownloadProgress) {
@@ -156,6 +225,27 @@ export function ResourceOverview() {
 
     return () => window.clearInterval(interval);
   }, [serverState?.running]);
+
+  useEffect(() => {
+    if (mode !== "host" || !serverState?.running) {
+      return;
+    }
+
+    void refreshPoolMembers();
+    const interval = window.setInterval(() => {
+      void refreshPoolMembers();
+    }, 4000);
+
+    return () => window.clearInterval(interval);
+  }, [mode, serverState?.running]);
+
+  useEffect(() => {
+    if (mode !== "connect") {
+      return;
+    }
+
+    void refreshLendState();
+  }, [mode, connectedServer?.url]);
 
   async function handleScan() {
     if (!window.constellation?.scanHardware) {
@@ -722,6 +812,171 @@ export function ResourceOverview() {
     await window.constellation.cancelDownload(id);
   }, []);
 
+  const refreshPoolMembers = useCallback(async () => {
+    if (!window.constellation?.listPoolMembers) {
+      return;
+    }
+
+    setPoolBusy(true);
+
+    try {
+      const response = await window.constellation.listPoolMembers();
+
+      if (response.ok) {
+        setPoolOffers(response.data);
+        setPoolError(null);
+      } else {
+        setPoolError(response.error);
+      }
+    } finally {
+      setPoolBusy(false);
+    }
+  }, []);
+
+  const refreshLendState = useCallback(async () => {
+    if (!window.constellation?.getLendState) {
+      return;
+    }
+
+    const response = await window.constellation.getLendState();
+
+    if (response.ok) {
+      setLendState(response.data);
+      setLendError(null);
+    } else {
+      setLendError(response.error);
+    }
+  }, []);
+
+  const handleStartLending = useCallback(
+    async (options: { port: number; vramMb: number; ramMb: number }) => {
+      if (!window.constellation?.startLending) {
+        setLendError("Desktop bridge is unavailable.");
+        return;
+      }
+
+      setLendBusy(true);
+      setLendError(null);
+
+      try {
+        const response = await window.constellation.startLending(options);
+
+        if (response.ok) {
+          setLendState(response.data);
+        } else {
+          setLendError(response.error);
+        }
+      } finally {
+        setLendBusy(false);
+      }
+    },
+    [],
+  );
+
+  const handleStopLending = useCallback(async () => {
+    if (!window.constellation?.stopLending) {
+      return;
+    }
+
+    setLendBusy(true);
+    setLendError(null);
+
+    try {
+      const response = await window.constellation.stopLending();
+
+      if (response.ok) {
+        setLendState(response.data);
+      } else {
+        setLendError(response.error);
+      }
+    } finally {
+      setLendBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    persistSelectedPeerIds(selectedPeerIds);
+  }, [selectedPeerIds]);
+
+  const handleTogglePeer = useCallback((peerId: string, enabled: boolean) => {
+    setSelectedPeerIds((current) => {
+      const next = new Set(current);
+
+      if (enabled) {
+        next.add(peerId);
+      } else {
+        next.delete(peerId);
+      }
+
+      return next;
+    });
+  }, []);
+
+  const handleSelectAllPeers = useCallback(() => {
+    setSelectedPeerIds(new Set(poolOffers.filter((offer) => offer.online).map((offer) => offer.peerId)));
+  }, [poolOffers]);
+
+  const handleSelectNonePeers = useCallback(() => {
+    setSelectedPeerIds(new Set());
+  }, []);
+
+  const applyDirty = useMemo(() => {
+    if (!aiState?.running) {
+      return false;
+    }
+
+    const desired = new Set(selectedRpcUrls(poolOffers, selectedPeerIds));
+    const current = new Set(aiState.rpcPeers);
+
+    if (desired.size !== current.size) {
+      return true;
+    }
+
+    for (const url of desired) {
+      if (!current.has(url)) {
+        return true;
+      }
+    }
+
+    return false;
+  }, [aiState?.running, aiState?.rpcPeers, poolOffers, selectedPeerIds]);
+
+  const handleApplyPool = useCallback(async () => {
+    if (!aiState?.running || !library?.lastModelPath || !window.constellation) {
+      return;
+    }
+
+    setApplyPoolBusy(true);
+    setAIError(null);
+
+    try {
+      const unloadResponse = await window.constellation.unloadAIModel();
+
+      if (!unloadResponse.ok) {
+        setAIError(unloadResponse.error);
+        return;
+      }
+
+      setAIState(unloadResponse.data);
+
+      const rpcPeers = selectedRpcUrls(poolOffers, selectedPeerIds);
+      const loadResponse = await window.constellation.loadAIModel({
+        modelPath: library.lastModelPath,
+        nGpuLayers: aiState.nGpuLayers,
+        contextSize: aiState.contextSize,
+        rpcPeers,
+      });
+
+      if (loadResponse.ok) {
+        setAIState(loadResponse.data);
+      } else {
+        setAIError(loadResponse.error);
+      }
+    } finally {
+      setApplyPoolBusy(false);
+    }
+  }, [aiState, library?.lastModelPath, poolOffers, selectedPeerIds]);
+
   const handleLoadAI = useCallback(
     async (options: { nGpuLayers: number; contextSize: number }) => {
       if (!window.constellation?.loadAIModel) {
@@ -737,11 +992,16 @@ export function ResourceOverview() {
       setAIBusy(true);
       setAIError(null);
 
+      const rpcPeers = poolOffers
+        .filter((offer) => offer.online && selectedPeerIds.has(offer.peerId))
+        .map((offer) => offer.rpcUrl);
+
       try {
         const response = await window.constellation.loadAIModel({
           modelPath: library.lastModelPath,
           nGpuLayers: options.nGpuLayers,
           contextSize: options.contextSize,
+          rpcPeers,
         });
 
         if (response.ok) {
@@ -753,7 +1013,7 @@ export function ResourceOverview() {
         setAIBusy(false);
       }
     },
-    [library?.lastModelPath],
+    [library?.lastModelPath, poolOffers, selectedPeerIds],
   );
 
   const handleUnloadAI = useCallback(async () => {
@@ -783,6 +1043,13 @@ export function ResourceOverview() {
 
   return (
     <section className="resource-page">
+      <StatusStrip
+        ai={aiState}
+        modelDisplayName={selectedModelName}
+        pool={poolOffers}
+        runtime={runtime}
+        server={serverState}
+      />
       <HardwareScanner error={error} onScan={handleScan} snapshot={snapshot} status={status} />
       <div className="mode-switch" role="tablist" aria-label="Node mode">
         <button
@@ -845,6 +1112,20 @@ export function ResourceOverview() {
             onSelect={handleSelectModel}
             selectedPath={selectedPath}
           />
+          <PoolPanel
+            aiState={aiState}
+            applyBusy={applyPoolBusy}
+            applyDirty={applyDirty}
+            busy={poolBusy}
+            error={poolError}
+            offers={poolOffers}
+            onApplyPool={handleApplyPool}
+            onRefresh={refreshPoolMembers}
+            onSelectAll={handleSelectAllPeers}
+            onSelectNone={handleSelectNonePeers}
+            onTogglePeer={handleTogglePeer}
+            selectedPeerIds={selectedPeerIds}
+          />
           <InferencePanel
             aiState={aiState}
             busy={aiBusy}
@@ -872,6 +1153,16 @@ export function ResourceOverview() {
             connection={connectedServer}
             error={connectError}
             onConnect={handleConnectServer}
+          />
+          <LendResourcesPanel
+            busy={lendBusy}
+            connection={connectedServer}
+            error={lendError}
+            hardware={snapshot}
+            lendState={lendState}
+            onRefresh={refreshLendState}
+            onStart={handleStartLending}
+            onStop={handleStopLending}
           />
           <ChatPanel
             busy={chatBusyByTarget.connected}

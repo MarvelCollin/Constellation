@@ -24,7 +24,10 @@ import type {
   DownloadProgress,
   DownloadStartRequest,
   DownloadStartResponse,
+  LendOptions,
+  LendStateResponse,
   ModelLibraryResponse,
+  PoolMembersResponse,
   RuntimeConfigResponse,
 } from "../shared/ai";
 
@@ -66,4 +69,8 @@ contextBridge.exposeInMainWorld("constellation", {
     ipcRenderer.on("download:progress", handler);
     return () => ipcRenderer.removeListener("download:progress", handler);
   },
+  getLendState: (): Promise<LendStateResponse> => ipcRenderer.invoke("pool:lend-state"),
+  startLending: (options: LendOptions): Promise<LendStateResponse> => ipcRenderer.invoke("pool:lend-start", options),
+  stopLending: (): Promise<LendStateResponse> => ipcRenderer.invoke("pool:lend-stop"),
+  listPoolMembers: (): Promise<PoolMembersResponse> => ipcRenderer.invoke("pool:members"),
 });

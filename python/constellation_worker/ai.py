@@ -39,6 +39,18 @@ class LlamaProcess:
   def state(self) -> dict[str, Any]:
     with self._lock:
       running = self._process is not None and self._process.poll() is None
+
+      if self._process is not None and not running:
+        exit_code = self._process.returncode
+        self._log.append(f"llama-server exited with code {exit_code}")
+        self._process = None
+        self._runtime_path = None
+        self._model_path = None
+        self._n_gpu_layers = 0
+        self._context_size = 0
+        self._rpc_peers = []
+        self._ready = False
+
       return {
         "running": running,
         "ready": self._ready and running,
@@ -143,8 +155,19 @@ class LlamaProcess:
         if len(self._log) > 400:
           self._log = self._log[-400:]
 
+    process.wait()
+    exit_code = process.returncode
+
     with self._lock:
-      self._ready = False
+      if self._process is process:
+        self._log.append(f"llama-server exited with code {exit_code}")
+        self._process = None
+        self._runtime_path = None
+        self._model_path = None
+        self._n_gpu_layers = 0
+        self._context_size = 0
+        self._rpc_peers = []
+        self._ready = False
 
   def _poll_ready(self) -> None:
     process = self._process

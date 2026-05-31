@@ -26,6 +26,7 @@ class MainServer(ThreadingHTTPServer):
     self.lock = threading.Lock()
     self.peers: dict[str, dict[str, object]] = {}
     self.messages: list[dict[str, str]] = []
+    self.pool_offers: dict[str, dict[str, object]] = {}
 
 
 class MainRequestHandler(BaseHTTPRequestHandler):
@@ -86,6 +87,14 @@ class MainRequestHandler(BaseHTTPRequestHandler):
         return
 
       self.send_raw_json(HTTPStatus.OK, encode_state())
+      return
+
+    if self.path == "/api/pool/members":
+      if not self.is_authorized():
+        self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Unauthorized"})
+        return
+
+      self.send_json(HTTPStatus.OK, {"ok": True, "data": self.pool_members()})
       return
 
     self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
@@ -166,6 +175,51 @@ class MainRequestHandler(BaseHTTPRequestHandler):
 
     if self.path == "/api/ai/chat":
       self.proxy_completion()
+      return
+
+    if self.path == "/api/pool/offer":
+      payload = self.read_json()
+
+      if payload is None:
+        self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Invalid offer"})
+        return
+
+      peer_id = payload.get("peerId")
+      rpc_url = payload.get("rpcUrl")
+      vram_mb = payload.get("vramMb", 0)
+      ram_mb = payload.get("ramMb", 0)
+
+      if (
+        not isinstance(peer_id, str)
+        or not isinstance(rpc_url, str)
+        or not isinstance(vram_mb, int)
+        or not isinstance(ram_mb, int)
+        or len(peer_id) < 4
+        or len(rpc_url) < 3
+        or vram_mb < 0
+        or ram_mb < 0
+      ):
+        self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Invalid offer fields"})
+        return
+
+      offer = self.upsert_pool_offer(peer_id, rpc_url, vram_mb, ram_mb)
+
+      if offer is None:
+        self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Peer is not registered"})
+        return
+
+      self.send_json(HTTPStatus.OK, {"ok": True, "data": offer})
+      return
+
+    if self.path == "/api/pool/leave":
+      payload = self.read_json()
+
+      if payload is None or not isinstance(payload.get("peerId"), str):
+        self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Invalid leave request"})
+        return
+
+      removed = self.remove_pool_offer(str(payload["peerId"]))
+      self.send_json(HTTPStatus.OK, {"ok": True, "data": {"removed": removed}})
       return
 
     self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
@@ -285,6 +339,74 @@ class MainRequestHandler(BaseHTTPRequestHandler):
       self.server.messages = self.server.messages[-200:]
 
     return message
+
+  def upsert_pool_offer(self, peer_id: str, rpc_url: str, vram_mb: int, ram_mb: int) -> dict[str, object] | None:
+    with self.server.lock:
+      peer = self.server.peers.get(peer_id)
+
+      if peer is None:
+        return None
+
+      offer: dict[str, object] = {
+        "id": peer_id,
+        "peerId": peer_id,
+        "peerName": peer["name"],
+        "rpcUrl": rpc_url,
+        "vramMb": vram_mb,
+        "ramMb": ram_mb,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+      }
+      self.server.pool_offers[peer_id] = offer
+
+    return self.decorate_offer(offer)
+
+  def remove_pool_offer(self, peer_id: str) -> bool:
+    with self.server.lock:
+      return self.server.pool_offers.pop(peer_id, None) is not None
+
+  def pool_members(self) -> list[dict[str, object]]:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=PEER_STALE_SECONDS)
+    items: list[dict[str, object]] = []
+
+    with self.server.lock:
+      offers = list(self.server.pool_offers.values())
+      peers = dict(self.server.peers)
+
+    for offer in offers:
+      peer_id = str(offer.get("peerId"))
+      peer = peers.get(peer_id)
+
+      if peer is None:
+        continue
+
+      last_seen_value = peer.get("lastSeen")
+      last_seen = (
+        datetime.fromisoformat(last_seen_value) if isinstance(last_seen_value, str) else now
+      )
+      online = last_seen >= cutoff
+
+      items.append({
+        "id": offer["id"],
+        "peerId": peer_id,
+        "peerName": offer["peerName"],
+        "rpcUrl": offer["rpcUrl"],
+        "vramMb": offer["vramMb"],
+        "ramMb": offer["ramMb"],
+        "createdAt": offer["createdAt"],
+        "lastSeen": peer["lastSeen"],
+        "online": online,
+      })
+
+    items.sort(key=lambda offer: str(offer["lastSeen"]), reverse=True)
+    return items
+
+  def decorate_offer(self, offer: dict[str, object]) -> dict[str, object]:
+    return {
+      **offer,
+      "online": True,
+      "lastSeen": datetime.now(timezone.utc).isoformat(),
+    }
 
   def proxy_completion(self) -> None:
     raw = self.read_raw_body()

@@ -24,7 +24,10 @@ import type {
   DownloadProgress,
   DownloadStartRequest,
   DownloadStartResponse,
+  LendOptions,
+  LendStateResponse,
   ModelLibraryResponse,
+  PoolMembersResponse,
   RuntimeConfigResponse,
 } from "../../shared/ai";
 
@@ -60,6 +63,10 @@ declare global {
       cancelDownload: (id: string) => Promise<DownloadCancelResponse>;
       openExternal: (url: string) => Promise<{ ok: true } | { ok: false; error: string }>;
       onDownloadProgress: (listener: (progress: DownloadProgress) => void) => () => void;
+      getLendState: () => Promise<LendStateResponse>;
+      startLending: (options: LendOptions) => Promise<LendStateResponse>;
+      stopLending: () => Promise<LendStateResponse>;
+      listPoolMembers: () => Promise<PoolMembersResponse>;
     };
   }
 }

@@ -5,7 +5,7 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, st
 import type { IpcMainInvokeEvent } from "electron";
 import { connect as connectSocket } from "node:net";
 import { hostname, networkInterfaces, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type {
   ChatFetchRequest,
   ChatMessage,
@@ -36,8 +36,13 @@ import type {
   DownloadProgress,
   DownloadStartRequest,
   DownloadStartResponse,
+  LendOptions,
+  LendState,
+  LendStateResponse,
   ModelLibrary,
   ModelLibraryResponse,
+  PoolMembersResponse,
+  PoolOffer,
   RuntimeConfig,
   RuntimeConfigResponse,
   SavedModelEntry,
@@ -93,6 +98,31 @@ type ActiveDownload = {
 
 const downloads = new Map<string, ActiveDownload>();
 let mainWindow: BrowserWindow | null = null;
+
+const RPC_DEFAULT_PORT = 50052;
+const RPC_LOG_LIMIT = 100;
+
+type LendRuntimeState = {
+  process: ChildProcessWithoutNullStreams | null;
+  port: number;
+  rpcUrl: string | null;
+  vramMb: number;
+  ramMb: number;
+  offerId: string | null;
+  message: string | null;
+  log: string[];
+};
+
+const lendState: LendRuntimeState = {
+  process: null,
+  port: RPC_DEFAULT_PORT,
+  rpcUrl: null,
+  vramMb: 0,
+  ramMb: 0,
+  offerId: null,
+  message: null,
+  log: [],
+};
 
 function userDataDir() {
   return app.getPath("userData");
@@ -407,11 +437,123 @@ function parseLoadOptions(value: unknown): AILoadOptions | null {
     return null;
   }
 
+  const rawRpcPeers = value.rpcPeers;
+  const rpcPeers: string[] = [];
+
+  if (Array.isArray(rawRpcPeers)) {
+    for (const peer of rawRpcPeers) {
+      if (typeof peer === "string" && peer.length > 0) {
+        rpcPeers.push(peer);
+      }
+    }
+  }
+
   return {
     modelPath: value.modelPath,
     nGpuLayers: Math.floor(value.nGpuLayers),
     contextSize: Math.floor(value.contextSize),
+    rpcPeers,
   };
+}
+
+function rpcServerExecutable(runtimePath: string): string {
+  const directory = dirname(runtimePath);
+  const name = process.platform === "win32" ? "rpc-server.exe" : "rpc-server";
+  return join(directory, name);
+}
+
+function currentLendState(): LendState {
+  return {
+    running: lendState.process !== null,
+    port: lendState.port,
+    rpcUrl: lendState.rpcUrl,
+    vramMb: lendState.vramMb,
+    ramMb: lendState.ramMb,
+    offerId: lendState.offerId,
+    message: lendState.message,
+    log: lendState.log.slice(-30),
+  };
+}
+
+function resetLendRuntime() {
+  lendState.process = null;
+  lendState.rpcUrl = null;
+  lendState.vramMb = 0;
+  lendState.ramMb = 0;
+  lendState.offerId = null;
+  lendState.log = [];
+}
+
+function appendLendLog(line: string) {
+  lendState.log.push(line);
+
+  if (lendState.log.length > RPC_LOG_LIMIT) {
+    lendState.log = lendState.log.slice(-RPC_LOG_LIMIT);
+  }
+}
+
+function killLendProcess() {
+  const child = lendState.process;
+
+  if (child !== null) {
+    try {
+      child.kill();
+    } catch {
+      return;
+    }
+  }
+}
+
+function parseLendOptions(value: unknown): LendOptions | null {
+  if (
+    !isRecord(value) ||
+    typeof value.port !== "number" ||
+    typeof value.vramMb !== "number" ||
+    typeof value.ramMb !== "number"
+  ) {
+    return null;
+  }
+
+  if (value.port < 1024 || value.port > 65535) {
+    return null;
+  }
+
+  if (value.vramMb < 0 || value.vramMb > 1_048_576) {
+    return null;
+  }
+
+  if (value.ramMb < 0 || value.ramMb > 1_048_576) {
+    return null;
+  }
+
+  return {
+    port: Math.floor(value.port),
+    vramMb: Math.floor(value.vramMb),
+    ramMb: Math.floor(value.ramMb),
+  };
+}
+
+function isPoolOffer(value: unknown): value is PoolOffer {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.peerId === "string" &&
+    typeof value.peerName === "string" &&
+    typeof value.rpcUrl === "string" &&
+    typeof value.vramMb === "number" &&
+    typeof value.ramMb === "number" &&
+    typeof value.createdAt === "string" &&
+    typeof value.lastSeen === "string" &&
+    typeof value.online === "boolean"
+  );
+}
+
+async function callConnectedServer(path: string, init?: RequestInit): Promise<unknown> {
+  if (!connectedServer) {
+    throw new Error("Not connected to a host server.");
+  }
+
+  return serverJsonRequest(connectedServer.url, connectedServer.token, path, init);
 }
 
 function parseDownloadStartRequest(value: unknown): DownloadStartRequest | null {
@@ -1709,7 +1851,7 @@ async function loadAIModel(_event: IpcMainInvokeEvent, value: unknown): Promise<
         modelPath: options.modelPath,
         nGpuLayers: options.nGpuLayers,
         contextSize: options.contextSize,
-        rpcPeers: [],
+        rpcPeers: options.rpcPeers ?? [],
       }),
     });
 
@@ -1813,6 +1955,174 @@ function openExternal(_event: IpcMainInvokeEvent, value: unknown): { ok: true } 
   return { ok: true };
 }
 
+function getLendState(): LendStateResponse {
+  return { ok: true, data: currentLendState() };
+}
+
+async function startLending(_event: IpcMainInvokeEvent, value: unknown): Promise<LendStateResponse> {
+  if (lendState.process !== null) {
+    return { ok: true, data: currentLendState() };
+  }
+
+  if (!connectedServer) {
+    return { ok: false, error: "Connect to a host first, then lend resources." };
+  }
+
+  const options = parseLendOptions(value);
+
+  if (options === null) {
+    return { ok: false, error: "Invalid lend options." };
+  }
+
+  const runtime = buildRuntimeConfig();
+
+  if (runtime.path === null || !runtime.exists) {
+    return { ok: false, error: "Configure llama-server first - rpc-server lives next to it." };
+  }
+
+  const executable = rpcServerExecutable(runtime.path);
+
+  if (!existsSync(executable)) {
+    return {
+      ok: false,
+      error: `rpc-server was not found next to llama-server. Expected at ${executable}.`,
+    };
+  }
+
+  const memArgMb = options.vramMb > 0 ? options.vramMb : options.ramMb;
+  const args: string[] = ["-H", "0.0.0.0", "-p", String(options.port)];
+
+  if (memArgMb > 0) {
+    args.push("-m", String(memArgMb));
+  }
+
+  let child: ChildProcessWithoutNullStreams;
+
+  try {
+    child = spawn(executable, args, { windowsHide: true });
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Could not start rpc-server.",
+    };
+  }
+
+  lendState.process = child;
+  lendState.port = options.port;
+  lendState.vramMb = options.vramMb;
+  lendState.ramMb = options.ramMb;
+  lendState.offerId = null;
+  lendState.message = "rpc-server starting";
+  lendState.log = [];
+  lendState.rpcUrl = `${lanAddress()}:${options.port}`;
+
+  child.stdout.on("data", (chunk: Buffer) => {
+    for (const line of chunk.toString().split(/\r?\n/)) {
+      if (line.trim().length > 0) {
+        appendLendLog(line.trim());
+      }
+    }
+  });
+
+  child.stderr.on("data", (chunk: Buffer) => {
+    for (const line of chunk.toString().split(/\r?\n/)) {
+      if (line.trim().length > 0) {
+        appendLendLog(line.trim());
+      }
+    }
+  });
+
+  child.on("exit", (code: number | null) => {
+    appendLendLog(`rpc-server exited with code ${code ?? "unknown"}`);
+
+    if (lendState.process === child) {
+      resetLendRuntime();
+      lendState.message = `rpc-server stopped (exit ${code ?? "unknown"})`;
+    }
+  });
+
+  child.on("error", (error: Error) => {
+    appendLendLog(`rpc-server error: ${error.message}`);
+
+    if (lendState.process === child) {
+      resetLendRuntime();
+      lendState.message = `rpc-server error: ${error.message}`;
+    }
+  });
+
+  try {
+    const offerResponse = await callConnectedServer("/api/pool/offer", {
+      method: "POST",
+      body: JSON.stringify({
+        peerId: connectedServer.peerId,
+        rpcUrl: lendState.rpcUrl,
+        vramMb: options.vramMb,
+        ramMb: options.ramMb,
+      }),
+    });
+
+    if (!isRecord(offerResponse) || offerResponse.ok !== true || !isPoolOffer(offerResponse.data)) {
+      throw new Error("Host rejected the pool offer.");
+    }
+
+    lendState.offerId = offerResponse.data.id;
+    lendState.message = "Lending resources to host";
+    return { ok: true, data: currentLendState() };
+  } catch (error) {
+    killLendProcess();
+    resetLendRuntime();
+    lendState.message = error instanceof Error ? error.message : "Could not register offer.";
+    return { ok: false, error: lendState.message ?? "Could not register offer." };
+  }
+}
+
+async function stopLending(): Promise<LendStateResponse> {
+  const peerId = connectedServer?.peerId;
+  killLendProcess();
+
+  if (peerId) {
+    try {
+      await callConnectedServer("/api/pool/leave", {
+        method: "POST",
+        body: JSON.stringify({ peerId }),
+      });
+    } catch {
+      lendState.message = "Stopped lending locally - host might still see a stale offer until heartbeat ages it out.";
+    }
+  }
+
+  resetLendRuntime();
+
+  if (lendState.message === null) {
+    lendState.message = "Not lending";
+  }
+
+  return { ok: true, data: currentLendState() };
+}
+
+async function listPoolMembers(): Promise<PoolMembersResponse> {
+  if (!mainServerProcess || !mainServerState.token) {
+    return { ok: false, error: "Start the server before listing pool members." };
+  }
+
+  try {
+    const payload = await localServerRequest("/api/pool/members");
+
+    if (
+      !isRecord(payload) ||
+      payload.ok !== true ||
+      !Array.isArray(payload.data) ||
+      !payload.data.every(isPoolOffer)
+    ) {
+      return { ok: false, error: "Unexpected pool members response." };
+    }
+
+    return { ok: true, data: payload.data };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Could not list pool members." };
+  }
+}
+
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1280,
@@ -1873,6 +2183,10 @@ void app.whenReady().then(() => {
   ipcMain.handle("downloads:start", startDownload);
   ipcMain.handle("downloads:cancel", cancelDownload);
   ipcMain.handle("shell:open-external", openExternal);
+  ipcMain.handle("pool:lend-state", getLendState);
+  ipcMain.handle("pool:lend-start", startLending);
+  ipcMain.handle("pool:lend-stop", stopLending);
+  ipcMain.handle("pool:members", listPoolMembers);
   createWindow();
 
   app.on("activate", () => {
@@ -1889,6 +2203,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  killLendProcess();
+  resetLendRuntime();
   stopConnectedHeartbeat();
   connectedServer = null;
   cleanupMainServerProcesses();
