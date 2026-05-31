@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ConnectedServerState, HardwareSnapshot } from "../../../../shared/hardware";
+import type { ConnectedServerState, GpuInfo, HardwareSnapshot } from "../../../../shared/hardware";
 import type { LendState } from "../../../../shared/ai";
+import { formatVendor } from "../resources/formatHardware";
 
 type LendResourcesPanelProps = {
   connection: ConnectedServerState | null;
@@ -8,20 +9,12 @@ type LendResourcesPanelProps = {
   lendState: LendState | null;
   busy: boolean;
   error: string | null;
-  onStart: (options: { port: number; vramMb: number; ramMb: number }) => Promise<void>;
+  onStart: (options: { port: number; vramMb: number; ramMb: number; selectedGpus: number[] }) => Promise<void>;
   onStop: () => Promise<void>;
   onRefresh: () => Promise<void>;
 };
 
 const DEFAULT_PORT = 50052;
-
-function totalFreeVram(hardware: HardwareSnapshot | null) {
-  if (!hardware) {
-    return 0;
-  }
-
-  return hardware.gpus.reduce((sum, gpu) => sum + (gpu.memory_free_mb || 0), 0);
-}
 
 function freeRamMb(hardware: HardwareSnapshot | null) {
   if (!hardware || hardware.memory_free_bytes === null) {
@@ -29,6 +22,11 @@ function freeRamMb(hardware: HardwareSnapshot | null) {
   }
 
   return Math.floor(hardware.memory_free_bytes / (1024 * 1024));
+}
+
+function gpuLabel(gpu: GpuInfo, index: number) {
+  const memory = gpu.memory_free_mb > 0 ? `${gpu.memory_free_mb} MB free` : "VRAM unknown";
+  return `#${index} · ${gpu.name} · ${formatVendor(gpu.vendor)} · ${memory}`;
 }
 
 export function LendResourcesPanel({
@@ -41,34 +39,92 @@ export function LendResourcesPanel({
   onStop,
   onRefresh,
 }: LendResourcesPanelProps) {
-  const maxVram = useMemo(() => totalFreeVram(hardware), [hardware]);
+  const gpus = hardware?.gpus ?? [];
   const maxRam = useMemo(() => freeRamMb(hardware), [hardware]);
-  const initialVram = Math.floor(maxVram * 0.75);
-  const initialRam = Math.floor(maxRam * 0.5);
   const [port, setPort] = useState(DEFAULT_PORT);
-  const [vramMb, setVramMb] = useState(initialVram);
-  const [ramMb, setRamMb] = useState(initialRam);
+  const [ramMb, setRamMb] = useState(0);
+  const [selectedGpus, setSelectedGpus] = useState<Set<number>>(() => new Set());
   const running = lendState?.running === true;
 
   useEffect(() => {
-    if (maxVram > 0 && vramMb === 0) {
-      setVramMb(Math.floor(maxVram * 0.75));
+    if (gpus.length === 0) {
+      setSelectedGpus(new Set());
+      return;
     }
 
+    setSelectedGpus((current) => {
+      if (current.size > 0) {
+        return current;
+      }
+
+      const next = new Set<number>();
+
+      for (let index = 0; index < gpus.length; index += 1) {
+        if (gpus[index].memory_free_mb > 0 || gpus[index].memory_mb > 0) {
+          next.add(index);
+        }
+      }
+
+      if (next.size === 0 && gpus.length > 0) {
+        next.add(0);
+      }
+
+      return next;
+    });
+  }, [gpus.length]);
+
+  useEffect(() => {
     if (maxRam > 0 && ramMb === 0) {
       setRamMb(Math.floor(maxRam * 0.5));
     }
-  }, [maxVram, maxRam]);
+  }, [maxRam]);
 
   useEffect(() => {
     void onRefresh();
   }, []);
 
-  const canStart = Boolean(connection) && !running && !busy;
+  const selectedVramMb = useMemo(() => {
+    let total = 0;
+
+    for (const index of selectedGpus) {
+      const gpu = gpus[index];
+
+      if (gpu) {
+        total += gpu.memory_free_mb || 0;
+      }
+    }
+
+    return total;
+  }, [gpus, selectedGpus]);
+
+  const canStart =
+    Boolean(connection) && !running && !busy && (gpus.length === 0 || selectedGpus.size > 0);
   const statusText = running ? "Lending resources" : "Idle";
   const statusToneClass = running
     ? "bg-timeline-grep/40 text-ink"
     : "bg-surface-strong text-muted";
+
+  function toggleGpu(index: number) {
+    setSelectedGpus((current) => {
+      const next = new Set(current);
+
+      if (next.has(index)) {
+        next.delete(index);
+      } else {
+        next.add(index);
+      }
+
+      return next;
+    });
+  }
+
+  function selectAllGpus() {
+    setSelectedGpus(new Set(gpus.map((_, index) => index)));
+  }
+
+  function clearGpus() {
+    setSelectedGpus(new Set());
+  }
 
   return (
     <section
@@ -86,8 +142,8 @@ export function LendResourcesPanel({
             Lend GPU and RAM
           </h2>
           <p className="text-[14px] leading-relaxed text-body max-w-prose">
-            Start an llama.cpp rpc-server next to your llama-server binary, then advertise capacity to the host.
-            The host can attach your GPU when it loads a model.
+            Choose which GPUs to share, then start an llama.cpp rpc-server next to your llama-server
+            binary. The host can attach selected GPUs when it loads a model.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -104,7 +160,14 @@ export function LendResourcesPanel({
             <button
               className="inline-flex h-11 items-center rounded-[8px] bg-ink px-5 text-[14px] font-medium text-canvas hover:bg-ink/90 disabled:opacity-60"
               disabled={!canStart}
-              onClick={() => void onStart({ port, vramMb, ramMb })}
+              onClick={() =>
+                void onStart({
+                  port,
+                  vramMb: selectedVramMb,
+                  ramMb,
+                  selectedGpus: Array.from(selectedGpus).sort((a, b) => a - b),
+                })
+              }
               type="button"
             >
               {busy ? "Working..." : "Start lending"}
@@ -125,7 +188,68 @@ export function LendResourcesPanel({
         </p>
       ) : null}
 
-      <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-3">
+      <div className="mt-6 rounded-[8px] border border-hairline bg-canvas-soft p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-[14px] font-semibold text-ink">
+            GPUs to share <span className="font-mono text-[11px] uppercase tracking-[0.4px] text-muted">{selectedGpus.size} of {gpus.length}</span>
+          </h3>
+          <div className="flex gap-3 text-[12px]">
+            <button
+              className="font-medium text-ink underline-offset-2 hover:underline disabled:opacity-50"
+              disabled={running || busy || gpus.length === 0 || selectedGpus.size === gpus.length}
+              onClick={selectAllGpus}
+              type="button"
+            >
+              Select all
+            </button>
+            <span aria-hidden className="text-muted">·</span>
+            <button
+              className="font-medium text-ink underline-offset-2 hover:underline disabled:opacity-50"
+              disabled={running || busy || selectedGpus.size === 0}
+              onClick={clearGpus}
+              type="button"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+
+        {gpus.length === 0 ? (
+          <p className="mt-3 text-[13px] text-body">
+            No GPUs detected. You can still lend CPU/RAM by leaving the GPU list empty.
+          </p>
+        ) : (
+          <ul className="mt-3 flex flex-col gap-2">
+            {gpus.map((gpu, index) => {
+              const checked = selectedGpus.has(index);
+
+              return (
+                <li
+                  key={`${gpu.name}-${index}`}
+                  className={`flex items-center gap-3 rounded-[8px] border px-3 py-2 ${
+                    checked ? "border-ink bg-surface-card" : "border-hairline bg-surface-card"
+                  }`}
+                >
+                  <input
+                    checked={checked}
+                    className="h-4 w-4 accent-ink"
+                    disabled={running || busy}
+                    onChange={() => toggleGpu(index)}
+                    type="checkbox"
+                  />
+                  <span className="font-mono text-[12px] text-ink break-all">{gpuLabel(gpu, index)}</span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        <p className="mt-3 font-mono text-[11px] uppercase tracking-[0.4px] text-muted">
+          Combined VRAM offered: <strong className="text-ink">{selectedVramMb} MB</strong>
+        </p>
+      </div>
+
+      <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2">
         <label className="flex flex-col gap-1">
           <span className="font-mono text-[11px] uppercase tracking-[0.88px] text-muted">RPC port</span>
           <input
@@ -136,23 +260,6 @@ export function LendResourcesPanel({
             onChange={(event) => setPort(Math.max(1024, Math.min(65535, Number(event.currentTarget.value))))}
             type="number"
             value={port}
-          />
-        </label>
-        <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] uppercase tracking-[0.88px] text-muted">
-            VRAM budget ({maxVram} MB free)
-          </span>
-          <input
-            className="h-10 rounded-[8px] border border-hairline-strong bg-surface-card px-3 text-[14px] text-ink outline-none focus:border-ink"
-            disabled={running || busy}
-            max={Math.max(maxVram, 0)}
-            min={0}
-            onChange={(event) =>
-              setVramMb(Math.max(0, Math.min(maxVram, Number(event.currentTarget.value))))
-            }
-            step={128}
-            type="number"
-            value={vramMb}
           />
         </label>
         <label className="flex flex-col gap-1">

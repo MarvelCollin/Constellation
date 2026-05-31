@@ -108,6 +108,7 @@ type LendRuntimeState = {
   rpcUrl: string | null;
   vramMb: number;
   ramMb: number;
+  selectedGpus: number[];
   offerId: string | null;
   message: string | null;
   log: string[];
@@ -119,6 +120,7 @@ const lendState: LendRuntimeState = {
   rpcUrl: null,
   vramMb: 0,
   ramMb: 0,
+  selectedGpus: [],
   offerId: null,
   message: null,
   log: [],
@@ -286,78 +288,79 @@ function downloadSnapshot(download: ActiveDownload): DownloadProgress {
   };
 }
 
-async function performDownload(download: ActiveDownload, destinationDir: string) {
+async function streamUrlToFile(url: string, destination: string, download: ActiveDownload): Promise<void> {
+  const response = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    signal: download.controller.signal,
+  });
+
+  if (!response.ok || response.body === null) {
+    throw new Error(`Download failed with status ${response.status}`);
+  }
+
+  const totalHeader = response.headers.get("Content-Length");
+
+  if (totalHeader) {
+    download.totalBytes = Number.parseInt(totalHeader, 10);
+  }
+
+  mkdirSync(dirname(destination), { recursive: true });
+  const fileStream = createWriteStream(destination);
+  let lastEmit = 0;
+  const reader = response.body.getReader();
+
   try {
-    const response = await fetch(download.url, {
-      method: "GET",
-      redirect: "follow",
-      signal: download.controller.signal,
-    });
+    while (true) {
+      const { done, value } = await reader.read();
 
-    if (!response.ok || response.body === null) {
-      download.status = "error";
-      download.message = `Download failed with status ${response.status}`;
-      emitDownload(download);
-      return;
-    }
+      if (done) {
+        break;
+      }
 
-    const totalHeader = response.headers.get("Content-Length");
-    download.totalBytes = totalHeader ? Number.parseInt(totalHeader, 10) : null;
+      if (value && value.length > 0) {
+        const buffer = Buffer.from(value);
 
-    mkdirSync(destinationDir, { recursive: true });
-    const finalPath = join(destinationDir, basename(download.destination));
-    download.destination = finalPath;
-
-    const fileStream = createWriteStream(finalPath);
-    let lastEmit = 0;
-    const reader = response.body.getReader();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          break;
+        if (!fileStream.write(buffer)) {
+          await new Promise<void>((resolve) => fileStream.once("drain", resolve));
         }
 
-        if (value && value.length > 0) {
-          const buffer = Buffer.from(value);
+        download.receivedBytes += buffer.length;
+        const now = Date.now();
 
-          if (!fileStream.write(buffer)) {
-            await new Promise<void>((resolve) => fileStream.once("drain", resolve));
-          }
-
-          download.receivedBytes += buffer.length;
-          const now = Date.now();
-
-          if (now - lastEmit >= 200) {
-            lastEmit = now;
-            emitDownload(download);
-          }
+        if (now - lastEmit >= 200) {
+          lastEmit = now;
+          emitDownload(download);
         }
       }
-    } finally {
-      reader.releaseLock();
-      await new Promise<void>((resolve, reject) => {
-        fileStream.end((error?: NodeJS.ErrnoException | null) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-
-          resolve();
-        });
-      });
     }
+  } finally {
+    reader.releaseLock();
+    await new Promise<void>((resolve, reject) => {
+      fileStream.end((error?: NodeJS.ErrnoException | null) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve();
+      });
+    });
+  }
+}
+
+async function performDownload(download: ActiveDownload) {
+  try {
+    await streamUrlToFile(download.url, download.destination, download);
 
     download.status = "completed";
     download.message = "Download complete";
     emitDownload(download);
 
     if (download.kind === "runtime") {
-      persistRuntimePath(finalPath);
+      persistRuntimePath(download.destination);
     } else {
-      addModelPath(finalPath);
+      addModelPath(download.destination);
     }
   } catch (error) {
     if (existsSync(download.destination)) {
@@ -373,6 +376,239 @@ async function performDownload(download: ActiveDownload, destinationDir: string)
     emitDownload(download);
   } finally {
     setTimeout(() => downloads.delete(download.id), 5000);
+  }
+}
+
+const RUNTIME_INSTALL_ID = "runtime:auto-install";
+const LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+
+type GithubAsset = {
+  name: string;
+  browser_download_url: string;
+  size: number;
+};
+
+type GithubRelease = {
+  tag_name: string;
+  assets: GithubAsset[];
+};
+
+function isGithubAsset(value: unknown): value is GithubAsset {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    typeof value.browser_download_url === "string" &&
+    typeof value.size === "number"
+  );
+}
+
+function isGithubRelease(value: unknown): value is GithubRelease {
+  return (
+    isRecord(value) &&
+    typeof value.tag_name === "string" &&
+    Array.isArray(value.assets) &&
+    value.assets.every(isGithubAsset)
+  );
+}
+
+async function fetchLatestLlamaRelease(signal: AbortSignal): Promise<GithubRelease> {
+  const response = await fetch(LLAMA_RELEASES_API, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "Constellation-Desktop",
+    },
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new Error(`GitHub returned ${response.status} while looking up llama.cpp releases.`);
+  }
+
+  const payload: unknown = await response.json();
+
+  if (!isGithubRelease(payload)) {
+    throw new Error("GitHub release response did not contain expected fields.");
+  }
+
+  return payload;
+}
+
+function pickLlamaAsset(assets: GithubAsset[]): GithubAsset | null {
+  if (process.platform === "win32") {
+    const vulkan = assets.find((asset) => /bin-win-vulkan-x64\.zip$/i.test(asset.name));
+    if (vulkan) return vulkan;
+    const avx2 = assets.find((asset) => /bin-win-avx2-x64\.zip$/i.test(asset.name));
+    if (avx2) return avx2;
+    const avx = assets.find((asset) => /bin-win-avx-x64\.zip$/i.test(asset.name));
+    if (avx) return avx;
+    return null;
+  }
+
+  if (process.platform === "darwin") {
+    return assets.find((asset) => /bin-macos-arm64\.zip$/i.test(asset.name)) ?? null;
+  }
+
+  return null;
+}
+
+function extractZipOnWindows(zipPath: string, destination: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const command = [
+      `$ErrorActionPreference = 'Stop'`,
+      `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${destination.replace(/'/g, "''")}' -Force`,
+    ].join("; ");
+
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+      { windowsHide: true },
+    );
+
+    let stderr = "";
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (error) => {
+      reject(error);
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(stderr.trim() || `Expand-Archive exited with code ${code}`));
+    });
+  });
+}
+
+function findExecutableRecursive(rootDir: string, executableName: string): string | null {
+  const stack = [rootDir];
+  const lowerTarget = executableName.toLowerCase();
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+
+    if (!current) {
+      continue;
+    }
+
+    let entries: import("node:fs").Dirent[];
+
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(current, entry.name);
+
+      if (entry.isFile() && entry.name.toLowerCase() === lowerTarget) {
+        return fullPath;
+      }
+
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      }
+    }
+  }
+
+  return null;
+}
+
+async function installRuntime(): Promise<RuntimeConfigResponse> {
+  if (downloads.has(RUNTIME_INSTALL_ID)) {
+    return { ok: false, error: "A runtime install is already running." };
+  }
+
+  if (process.platform !== "win32" && process.platform !== "darwin") {
+    return { ok: false, error: "Auto-install supports Windows and macOS. Use Pick llama-server on other platforms." };
+  }
+
+  const progress: ActiveDownload = {
+    id: RUNTIME_INSTALL_ID,
+    kind: "runtime",
+    url: "",
+    destination: "",
+    status: "active",
+    receivedBytes: 0,
+    totalBytes: null,
+    message: "Looking up latest llama.cpp release",
+    controller: new AbortController(),
+  };
+
+  downloads.set(RUNTIME_INSTALL_ID, progress);
+  emitDownload(progress);
+
+  try {
+    const release = await fetchLatestLlamaRelease(progress.controller.signal);
+    const asset = pickLlamaAsset(release.assets);
+
+    if (!asset) {
+      throw new Error(
+        "No prebuilt llama.cpp archive matched this platform. Use Pick llama-server to point at a custom build.",
+      );
+    }
+
+    const runtimeBase = runtimeDir();
+    const versionDir = join(runtimeBase, release.tag_name);
+    const zipPath = join(runtimeBase, asset.name);
+
+    progress.url = asset.browser_download_url;
+    progress.destination = zipPath;
+    progress.totalBytes = asset.size;
+    progress.message = `Downloading ${asset.name}`;
+    emitDownload(progress);
+
+    await streamUrlToFile(asset.browser_download_url, zipPath, progress);
+
+    progress.message = `Extracting to ${versionDir}`;
+    emitDownload(progress);
+
+    mkdirSync(versionDir, { recursive: true });
+
+    if (process.platform === "win32") {
+      await extractZipOnWindows(zipPath, versionDir);
+    } else {
+      throw new Error("Auto-extract is currently implemented only for Windows.");
+    }
+
+    progress.message = "Locating llama-server";
+    emitDownload(progress);
+
+    const executableName = process.platform === "win32" ? "llama-server.exe" : "llama-server";
+    const executablePath = findExecutableRecursive(versionDir, executableName);
+
+    if (!executablePath) {
+      throw new Error(`${executableName} was not found inside the extracted archive.`);
+    }
+
+    persistRuntimePath(executablePath);
+
+    try {
+      unlinkSync(zipPath);
+    } catch {
+      progress.message = "Installed. Could not remove the temporary archive.";
+    }
+
+    progress.destination = executablePath;
+    progress.status = "completed";
+    progress.message = `llama.cpp ${release.tag_name} ready`;
+    emitDownload(progress);
+
+    return { ok: true, data: buildRuntimeConfig() };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Install failed";
+    progress.status = "error";
+    progress.message = message;
+    emitDownload(progress);
+    return { ok: false, error: message };
+  } finally {
+    setTimeout(() => downloads.delete(RUNTIME_INSTALL_ID), 5000);
   }
 }
 
@@ -469,6 +705,7 @@ function currentLendState(): LendState {
     rpcUrl: lendState.rpcUrl,
     vramMb: lendState.vramMb,
     ramMb: lendState.ramMb,
+    selectedGpus: [...lendState.selectedGpus],
     offerId: lendState.offerId,
     message: lendState.message,
     log: lendState.log.slice(-30),
@@ -480,6 +717,7 @@ function resetLendRuntime() {
   lendState.rpcUrl = null;
   lendState.vramMb = 0;
   lendState.ramMb = 0;
+  lendState.selectedGpus = [];
   lendState.offerId = null;
   lendState.log = [];
 }
@@ -526,10 +764,23 @@ function parseLendOptions(value: unknown): LendOptions | null {
     return null;
   }
 
+  const selectedGpus: number[] = [];
+
+  if (Array.isArray(value.selectedGpus)) {
+    for (const candidate of value.selectedGpus) {
+      if (typeof candidate === "number" && Number.isInteger(candidate) && candidate >= 0 && candidate < 32) {
+        if (!selectedGpus.includes(candidate)) {
+          selectedGpus.push(candidate);
+        }
+      }
+    }
+  }
+
   return {
     port: Math.floor(value.port),
     vramMb: Math.floor(value.vramMb),
     ramMb: Math.floor(value.ramMb),
+    selectedGpus,
   };
 }
 
@@ -1898,7 +2149,7 @@ function getAIChatEndpoint(): AIChatEndpointResponse {
   };
 }
 
-function startDownload(_event: IpcMainInvokeEvent, value: unknown): DownloadStartResponse {
+async function startDownload(_event: IpcMainInvokeEvent, value: unknown): Promise<DownloadStartResponse> {
   const request = parseDownloadStartRequest(value);
 
   if (request === null) {
@@ -1909,8 +2160,30 @@ function startDownload(_event: IpcMainInvokeEvent, value: unknown): DownloadStar
     return { ok: false, error: "Download id is already in use." };
   }
 
-  const destinationDir = request.kind === "runtime" ? runtimeDir() : modelsDir();
-  const destination = join(destinationDir, request.destinationName);
+  const defaultDir = request.kind === "runtime" ? runtimeDir() : modelsDir();
+  const owner = mainWindow;
+  let destination: string;
+
+  if (owner) {
+    const filters =
+      request.kind === "runtime"
+        ? [{ name: "All files", extensions: ["*"] }]
+        : [{ name: "GGUF model", extensions: ["gguf"] }];
+
+    const result = await dialog.showSaveDialog(owner, {
+      title: request.kind === "runtime" ? "Save runtime to..." : "Save model to...",
+      defaultPath: join(defaultDir, request.destinationName),
+      filters,
+    });
+
+    if (result.canceled || !result.filePath) {
+      return { ok: false, error: "Download cancelled" };
+    }
+
+    destination = result.filePath;
+  } else {
+    destination = join(defaultDir, request.destinationName);
+  }
 
   const download: ActiveDownload = {
     id: request.id,
@@ -1926,7 +2199,7 @@ function startDownload(_event: IpcMainInvokeEvent, value: unknown): DownloadStar
 
   downloads.set(request.id, download);
   emitDownload(download);
-  void performDownload(download, destinationDir);
+  void performDownload(download);
 
   return { ok: true, data: downloadSnapshot(download) };
 }
@@ -1997,9 +2270,17 @@ async function startLending(_event: IpcMainInvokeEvent, value: unknown): Promise
   }
 
   let child: ChildProcessWithoutNullStreams;
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+
+  if (options.selectedGpus.length > 0) {
+    const indices = options.selectedGpus.join(",");
+    childEnv.CUDA_VISIBLE_DEVICES = indices;
+    childEnv.HIP_VISIBLE_DEVICES = indices;
+    childEnv.GGML_VK_VISIBLE_DEVICES = indices;
+  }
 
   try {
-    child = spawn(executable, args, { windowsHide: true });
+    child = spawn(executable, args, { windowsHide: true, env: childEnv });
   } catch (error) {
     return {
       ok: false,
@@ -2011,6 +2292,7 @@ async function startLending(_event: IpcMainInvokeEvent, value: unknown): Promise
   lendState.port = options.port;
   lendState.vramMb = options.vramMb;
   lendState.ramMb = options.ramMb;
+  lendState.selectedGpus = [...options.selectedGpus];
   lendState.offerId = null;
   lendState.message = "rpc-server starting";
   lendState.log = [];
@@ -2172,6 +2454,7 @@ void app.whenReady().then(() => {
   ipcMain.handle("runtime:get", getRuntimeConfig);
   ipcMain.handle("runtime:pick", pickRuntime);
   ipcMain.handle("runtime:clear", clearRuntime);
+  ipcMain.handle("runtime:install", installRuntime);
   ipcMain.handle("models:list", listModels);
   ipcMain.handle("models:pick", pickModelFile);
   ipcMain.handle("models:remove", removeModelEntry);

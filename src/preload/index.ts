@@ -51,6 +51,7 @@ contextBridge.exposeInMainWorld("constellation", {
   getRuntimeConfig: (): Promise<RuntimeConfigResponse> => ipcRenderer.invoke("runtime:get"),
   pickRuntime: (): Promise<RuntimeConfigResponse> => ipcRenderer.invoke("runtime:pick"),
   clearRuntime: (): Promise<RuntimeConfigResponse> => ipcRenderer.invoke("runtime:clear"),
+  installRuntime: (): Promise<RuntimeConfigResponse> => ipcRenderer.invoke("runtime:install"),
   listModels: (): Promise<ModelLibraryResponse> => ipcRenderer.invoke("models:list"),
   pickModelFile: (): Promise<ModelLibraryResponse> => ipcRenderer.invoke("models:pick"),
   removeModelEntry: (path: string): Promise<ModelLibraryResponse> => ipcRenderer.invoke("models:remove", path),

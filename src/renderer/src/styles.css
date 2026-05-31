@@ -911,12 +911,13 @@ button {
 .ai-panel h3 {
   font-size: 18px;
   font-weight: 600;
-  margin: 24px 0 12px;
+  margin: 0 0 14px;
   color: var(--ink);
 }
 
 .model-recommended {
-  margin-top: 8px;
+  padding: 24px 32px;
+  border-bottom: 1px solid var(--hairline-soft);
 }
 
 .model-grid {
@@ -1064,7 +1065,7 @@ button {
 }
 
 .model-library {
-  margin-top: 8px;
+  padding: 24px 32px 28px;
 }
 
 .model-list {
@@ -1143,8 +1144,9 @@ button {
 .inference-config {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  margin-top: 8px;
+  gap: 16px;
+  margin: 16px 0 0;
+  padding: 0 32px;
 }
 
 .inference-config .field {
@@ -1187,12 +1189,13 @@ button {
 }
 
 .inference-transcript {
-  margin-top: 16px;
+  margin: 20px 32px 0;
   border: 1px solid var(--hairline);
   border-radius: var(--radius-lg);
   background: var(--canvas-soft);
-  padding: 16px;
-  max-height: 360px;
+  padding: 20px;
+  min-height: 200px;
+  max-height: 480px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -1253,8 +1256,9 @@ button {
 .inference-form {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-top: 12px;
+  gap: 10px;
+  margin: 16px 0 0;
+  padding: 0 32px 32px;
 }
 
 .inference-actions {

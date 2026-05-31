@@ -106,6 +106,7 @@ export type LendOptions = {
   port: number;
   vramMb: number;
   ramMb: number;
+  selectedGpus: number[];
 };
 
 export type LendState = {
@@ -114,6 +115,7 @@ export type LendState = {
   rpcUrl: string | null;
   vramMb: number;
   ramMb: number;
+  selectedGpus: number[];
   offerId: string | null;
   message: string | null;
   log: string[];

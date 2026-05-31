@@ -51,6 +51,7 @@ declare global {
       getRuntimeConfig: () => Promise<RuntimeConfigResponse>;
       pickRuntime: () => Promise<RuntimeConfigResponse>;
       clearRuntime: () => Promise<RuntimeConfigResponse>;
+      installRuntime: () => Promise<RuntimeConfigResponse>;
       listModels: () => Promise<ModelLibraryResponse>;
       pickModelFile: () => Promise<ModelLibraryResponse>;
       removeModelEntry: (path: string) => Promise<ModelLibraryResponse>;

@@ -797,7 +797,8 @@ export function ResourceOverview() {
 
       if (response.ok) {
         setDownloads((current) => ({ ...current, [response.data.id]: response.data }));
-      } else {
+        setLibraryError(null);
+      } else if (response.error !== "Download cancelled") {
         setLibraryError(response.error);
       }
     },
@@ -849,7 +850,7 @@ export function ResourceOverview() {
   }, []);
 
   const handleStartLending = useCallback(
-    async (options: { port: number; vramMb: number; ramMb: number }) => {
+    async (options: { port: number; vramMb: number; ramMb: number; selectedGpus: number[] }) => {
       if (!window.constellation?.startLending) {
         setLendError("Desktop bridge is unavailable.");
         return;

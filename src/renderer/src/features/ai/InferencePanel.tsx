@@ -389,7 +389,7 @@ export function InferencePanel({
       {error ? <div className="scan-error">{error}</div> : null}
       {chatError ? <div className="scan-error">{chatError}</div> : null}
 
-      <div className="px-8 pt-6">
+      <div className="border-b border-hairline-soft px-8 py-6">
         <div className="flex flex-wrap items-end gap-3">
           {renaming ? (
             <label className="flex min-w-0 flex-1 flex-col gap-1">
